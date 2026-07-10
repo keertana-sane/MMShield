@@ -1,0 +1,69 @@
+# ==========================
+# Python
+# ==========================
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+
+# ==========================
+# Virtual Environments
+# ==========================
+.venv/
+venv/
+env/
+
+# ==========================
+# macOS
+# ==========================
+.DS_Store
+
+# ==========================
+# VS Code
+# ==========================
+.vscode/
+
+# ==========================
+# Jupyter
+# ==========================
+.ipynb_checkpoints/
+
+# ==========================
+# Trained Models
+# ==========================
+*.pkl
+
+# ==========================
+# Temporary Output Files
+# ==========================
+outputs/attacked_documents/
+outputs/metadata/
+
+# Keep evaluation plots and feature CSVs
+!outputs/feature_vectors/
+!outputs/visualization/
+
+# ==========================
+# Logs
+# ==========================
+*.log
+
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Datasets
+datasets/
+
+# Generated outputs
+outputs/
+
+# Large model files
+*.bin
+*.pkl
