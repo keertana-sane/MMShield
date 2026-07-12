@@ -1,0 +1,15 @@
+numpy
+pandas
+opencv-contrib-python
+Pillow
+
+torch
+torchvision
+
+scikit-learn
+xgboost
+
+matplotlib
+
+tqdm
+joblib
