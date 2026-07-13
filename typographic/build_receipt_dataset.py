@@ -1,3 +1,18 @@
+"""
+Receipt Dataset Builder
+
+Builds the receipt-level training dataset (one row per receipt) by
+running OCR + typography + semantic feature extraction over every
+clean and attacked receipt image, aggregating each receipt's regions
+into a single fixed-length feature vector via ReceiptFeatureBuilder,
+and writing the result to receipt_dataset.csv. This is the dataset
+actually consumed by train.py, evaluate.py, and predict.py.
+"""
+
+import logging
+from pathlib import Path
+from typing import Any, Optional
+
 import pandas as pd
 
 from config import TRAIN_IMAGES
@@ -10,15 +25,26 @@ from semantic import SemanticAnalyzer
 from receipt_features import ReceiptFeatureBuilder
 
 
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+__all__ = ["ReceiptDatasetBuilder"]
+
+
 class ReceiptDatasetBuilder:
-
     """
-    Creates one feature vector per receipt.
+    Creates one feature vector per receipt, across clean (label=0) and
+    attacked (label=1) images.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
 
-        print("Initializing modules...\n")
+        logger.info("Initializing modules...")
 
         self.ocr = OCRExtractor()
 
@@ -28,155 +54,182 @@ class ReceiptDatasetBuilder:
 
         self.receipt_builder = ReceiptFeatureBuilder()
 
-        self.dataset = []
+        self.dataset: list[dict[str, Any]] = []
 
     ######################################################
 
-    def process_receipt(self, image_path, label):
+    def process_receipt(self, image_path: Path, label: int) -> bool:
+        """
+        Extracts, aggregates, and appends one receipt's feature
+        vector to self.dataset.
 
-        print(f"Processing : {image_path.name}")
+        Args:
+            image_path: Path to the receipt image.
+            label: 0 for clean, 1 for attacked.
 
-        regions = self.ocr.extract_text_regions(image_path)
+        Returns:
+            True if a feature vector was appended, False if the
+            receipt was skipped (no OCR regions detected, or an error
+            occurred during processing).
+        """
 
-        region_features = []
+        logger.info("Processing: %s", image_path.name)
 
-        for region in regions:
+        try:
 
-            typography_features = self.typography.extract_features(
-                region
+            regions = self.ocr.extract_text_regions(image_path)
+
+            region_features = []
+
+            for region in regions:
+
+                typography_features = self.typography.extract_features(
+                    region
+                )
+
+                semantic_features = self.semantic.extract_features(
+                    region["text"]
+                )
+
+                typography_features.update(semantic_features)
+
+                region_features.append(typography_features)
+
+            receipt_features = self.receipt_builder.aggregate(
+                region_features
             )
 
-            semantic_features = self.semantic.extract_features(
-                region["text"]
+            if receipt_features is None:
+
+                logger.warning(
+                    "No text regions detected in '%s'; skipping.",
+                    image_path.name,
+                )
+
+                return False
+
+            receipt_features["image_name"] = image_path.name
+
+            receipt_features["label"] = label
+
+            self.dataset.append(receipt_features)
+
+            return True
+
+        except Exception as exc:
+
+            logger.error(
+                "Skipping '%s' due to error: %s",
+                image_path.name,
+                exc,
             )
 
-            typography_features.update(
-                semantic_features
-            )
+            return False
 
-            region_features.append(
-                typography_features
-            )
-
-        receipt_features = self.receipt_builder.aggregate(
-            region_features
-        )
-
-        if receipt_features is None:
-
-            return
-
-        receipt_features["image_name"] = image_path.name
-
-        receipt_features["label"] = label
-
-        self.dataset.append(
-            receipt_features
-        )
-    
-        ######################################################
+    ######################################################
 
     def build_dataset(
-
         self,
+        max_clean: Optional[int] = 10,
+        max_attack: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """
+        Processes clean and attacked receipt images, builds the
+        receipt-level dataset, writes it to CSV, and returns it.
 
-        max_clean=10,
+        Args:
+            max_clean: Maximum number of clean images to process
+                (None = all).
+            max_attack: Maximum number of attacked images to process
+                (None = all).
 
-        max_attack=None
+        Returns:
+            The resulting DataFrame (also written to
+            FEATURE_OUTPUT/receipt_dataset.csv).
+        """
 
-    ):
+        clean_images = sorted(TRAIN_IMAGES.glob("*.jpg"))
 
-        clean_images = sorted(
+        if not clean_images:
 
-            TRAIN_IMAGES.glob("*.jpg")
-
-        )
+            logger.warning(
+                "No clean images found under %s.", TRAIN_IMAGES
+            )
 
         if max_clean is not None:
 
             clean_images = clean_images[:max_clean]
 
-        attack_images = sorted(
+        attack_images = sorted(ATTACK_OUTPUT.glob("*.jpg"))
 
-            ATTACK_OUTPUT.glob("*.jpg")
+        if not attack_images:
 
-        )
+            logger.warning(
+                "No attack images found under %s.", ATTACK_OUTPUT
+            )
 
         if max_attack is not None:
 
             attack_images = attack_images[:max_attack]
 
-        print("\n==============================")
-        print("Processing CLEAN receipts")
-        print("==============================\n")
+        logger.info("Processing CLEAN receipts...")
+
+        skipped_clean = 0
 
         for i, image in enumerate(clean_images, 1):
 
-            print(f"[Clean {i}/{len(clean_images)}]")
+            logger.info("[Clean %d/%d]", i, len(clean_images))
 
-            self.process_receipt(
+            if not self.process_receipt(image, label=0):
 
-                image,
+                skipped_clean += 1
 
-                label=0
+        logger.info("Processing ATTACK receipts...")
 
-            )
-
-        print("\n==============================")
-        print("Processing ATTACK receipts")
-        print("==============================\n")
+        skipped_attack = 0
 
         for i, image in enumerate(attack_images, 1):
 
-            print(f"[Attack {i}/{len(attack_images)}]")
+            logger.info("[Attack %d/%d]", i, len(attack_images))
 
-            self.process_receipt(
+            if not self.process_receipt(image, label=1):
 
-                image,
+                skipped_attack += 1
 
-                label=1
+        df = pd.DataFrame(self.dataset)
 
+        output_path = FEATURE_OUTPUT / "receipt_dataset.csv"
+
+        df.to_csv(output_path, index=False)
+
+        logger.info("Receipt dataset created successfully.")
+
+        logger.info("Saved to: %s", output_path)
+
+        logger.info("Total receipts: %d", len(df))
+
+        if skipped_clean or skipped_attack:
+
+            logger.warning(
+                "Skipped %d clean and %d attack image(s) "
+                "(errors or zero detected regions).",
+                skipped_clean,
+                skipped_attack,
             )
 
-        df = pd.DataFrame(
+        if not df.empty:
 
-            self.dataset
+            logger.info(
+                "Label distribution:\n%s",
+                df["label"].value_counts().to_string(),
+            )
 
-        )
+        else:
 
-        output_path = (
-
-            FEATURE_OUTPUT /
-
-            "receipt_dataset.csv"
-
-        )
-
-        df.to_csv(
-
-            output_path,
-
-            index=False
-
-        )
-
-        print("\n====================================")
-
-        print("Receipt Dataset Created Successfully!")
-
-        print("====================================")
-
-        print(f"\nSaved to:\n{output_path}")
-
-        print(f"\nTotal Receipts : {len(df)}")
-
-        print("\nLabel Distribution")
-
-        print(
-
-            df["label"].value_counts()
-
-        )
+            logger.warning(
+                "Resulting dataset is empty — no receipts were "
+                "successfully processed."
+            )
 
         return df
 

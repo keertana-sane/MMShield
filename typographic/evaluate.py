@@ -1,3 +1,16 @@
+"""
+Typographic Model Evaluator
+
+Loads the trained Random Forest model (typographic_model.pkl) and the
+receipt-level dataset, evaluates it on a held-out stratified test
+split, and produces accuracy/precision/recall/F1, a confusion matrix,
+feature importances, and an ROC curve — saving each plot under
+FEATURE_OUTPUT.
+"""
+
+import logging
+from pathlib import Path
+
 import joblib
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -10,7 +23,7 @@ from sklearn.metrics import (
     confusion_matrix,
     ConfusionMatrixDisplay,
     roc_curve,
-    auc
+    auc,
 )
 
 from sklearn.model_selection import train_test_split
@@ -18,62 +31,111 @@ from sklearn.model_selection import train_test_split
 from config import FEATURE_OUTPUT
 
 
-MODEL_PATH = FEATURE_OUTPUT / "typographic_model.pkl"
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+__all__ = ["TypographicEvaluator"]
+
+MODEL_PATH: Path = FEATURE_OUTPUT / "typographic_model.pkl"
+
+_DROP_COLUMNS: tuple[str, ...] = ("image_name", "label")
 
 
 class TypographicEvaluator:
+    """
+    Evaluates the trained typographic attack-detection model.
+    """
 
-    def __init__(self):
+    def __init__(self) -> None:
+
+        if not MODEL_PATH.is_file():
+
+            raise FileNotFoundError(
+                f"Model not found at '{MODEL_PATH}'. Run train.py first."
+            )
 
         self.model = joblib.load(MODEL_PATH)
 
-        self.feature_names = None
+        self.feature_names: list[str] = []
 
     ########################################################
 
-    def load_dataset(self):
+    def load_dataset(self) -> pd.DataFrame:
+        """
+        Loads the receipt-level feature dataset and records feature
+        column names.
 
-        dataset = FEATURE_OUTPUT / "receipt_dataset.csv"
+        Returns:
+            The loaded DataFrame.
 
-        df = pd.read_csv(dataset)
+        Raises:
+            FileNotFoundError: If receipt_dataset.csv is missing.
+            ValueError: If the dataset is empty or missing required
+                columns.
+        """
+
+        dataset_path = FEATURE_OUTPUT / "receipt_dataset.csv"
+
+        if not dataset_path.is_file():
+
+            raise FileNotFoundError(
+                f"Dataset not found at '{dataset_path}'. Run "
+                "build_receipt_dataset.py first."
+            )
+
+        df = pd.read_csv(dataset_path)
+
+        if df.empty:
+
+            raise ValueError(f"Dataset at '{dataset_path}' is empty.")
+
+        missing_columns = [
+            col for col in _DROP_COLUMNS if col not in df.columns
+        ]
+
+        if missing_columns:
+
+            raise ValueError(
+                f"Dataset is missing required column(s) {missing_columns}."
+            )
 
         self.feature_names = list(
-
-            df.drop(
-
-                columns=[
-
-                    "image_name",
-
-                    "label"
-
-                ]
-
-            ).columns
-
+            df.drop(columns=list(_DROP_COLUMNS)).columns
         )
 
         return df
 
     ########################################################
 
-    def evaluate(self):
+    def evaluate(self) -> dict[str, float]:
+        """
+        Runs the full evaluation: metrics, confusion matrix, feature
+        importance, and ROC curve, saving each plot to disk.
+
+        Returns:
+            Dict of accuracy, precision, recall, f1, and roc_auc.
+        """
 
         df = self.load_dataset()
 
-        X = df.drop(
-
-            columns=[
-
-                "image_name",
-
-                "label"
-
-            ]
-
-        )
+        X = df.drop(columns=list(_DROP_COLUMNS))
 
         y = df["label"]
+
+        class_counts = y.value_counts()
+
+        if (class_counts < 2).any():
+
+            raise ValueError(
+                "Each class needs at least 2 samples for a stratified "
+                f"train/test split. Got class counts: "
+                f"{class_counts.to_dict()}"
+            )
 
         X_train, X_test, y_train, y_test = train_test_split(
 
@@ -89,70 +151,34 @@ class TypographicEvaluator:
 
         )
 
-        predictions = self.model.predict(
+        predictions = self.model.predict(X_test)
 
-            X_test
+        probabilities = self.model.predict_proba(X_test)[:, 1]
 
-        )
+        metrics = {
+            "accuracy": accuracy_score(y_test, predictions),
+            "precision": precision_score(y_test, predictions, zero_division=0),
+            "recall": recall_score(y_test, predictions, zero_division=0),
+            "f1": f1_score(y_test, predictions, zero_division=0),
+        }
 
-        probabilities = self.model.predict_proba(
-
-            X_test
-
-        )[:,1]
-
-        print("\n====================================")
-        print("Evaluation Metrics")
-        print("====================================\n")
-
-        print(
-
-            f"Accuracy  : {accuracy_score(y_test,predictions):.4f}"
-
-        )
-
-        print(
-
-            f"Precision : {precision_score(y_test,predictions):.4f}"
-
-        )
-
-        print(
-
-            f"Recall    : {recall_score(y_test,predictions):.4f}"
-
-        )
-
-        print(
-
-            f"F1 Score  : {f1_score(y_test,predictions):.4f}"
-
-        )
+        logger.info("=" * 40)
+        logger.info("Evaluation Metrics")
+        logger.info("=" * 40)
+        logger.info("Accuracy  : %.4f", metrics["accuracy"])
+        logger.info("Precision : %.4f", metrics["precision"])
+        logger.info("Recall    : %.4f", metrics["recall"])
+        logger.info("F1 Score  : %.4f", metrics["f1"])
 
         ########################################################
         # Confusion Matrix
         ########################################################
 
-        cm = confusion_matrix(
-
-            y_test,
-
-            predictions
-
-        )
+        cm = confusion_matrix(y_test, predictions)
 
         disp = ConfusionMatrixDisplay(
-
             confusion_matrix=cm,
-
-            display_labels=[
-
-                "Safe",
-
-                "Attack"
-
-            ]
-
+            display_labels=["Safe", "Attack"],
         )
 
         disp.plot()
@@ -161,17 +187,11 @@ class TypographicEvaluator:
 
         plt.tight_layout()
 
-        plt.savefig(
+        cm_path = FEATURE_OUTPUT / "confusion_matrix.png"
 
-            FEATURE_OUTPUT /
+        plt.savefig(cm_path, dpi=300)
 
-            "confusion_matrix.png",
-
-            dpi=300
-
-        )
-
-        plt.show()
+        plt.close()
 
         ########################################################
         # Feature Importance
@@ -180,42 +200,18 @@ class TypographicEvaluator:
         importance = self.model.feature_importances_
 
         feature_importance = pd.DataFrame({
-
             "Feature": self.feature_names,
+            "Importance": importance,
+        }).sort_values(by="Importance", ascending=False)
 
-            "Importance": importance
-
-        })
-
-        feature_importance = feature_importance.sort_values(
-
-            by="Importance",
-
-            ascending=False
-
-        )
-
-        print("\n====================================")
-        print("Top 10 Important Features")
-        print("====================================\n")
-
-        print(
-
-            feature_importance.head(10)
-
-        )
+        logger.info("Top 10 Important Features:\n%s",
+                     feature_importance.head(10).to_string(index=False))
 
         top10 = feature_importance.head(10)
 
-        plt.figure(figsize=(10,6))
+        plt.figure(figsize=(10, 6))
 
-        plt.barh(
-
-            top10["Feature"][::-1],
-
-            top10["Importance"][::-1]
-
-        )
+        plt.barh(top10["Feature"][::-1], top10["Importance"][::-1])
 
         plt.xlabel("Importance Score")
 
@@ -225,61 +221,27 @@ class TypographicEvaluator:
 
         plt.tight_layout()
 
-        plt.savefig(
+        fi_path = FEATURE_OUTPUT / "feature_importance.png"
 
-            FEATURE_OUTPUT /
+        plt.savefig(fi_path, dpi=300)
 
-            "feature_importance.png",
-
-            dpi=300
-
-        )
-
-        plt.show()
+        plt.close()
 
         ########################################################
         # ROC Curve
         ########################################################
 
-        fpr, tpr, thresholds = roc_curve(
+        fpr, tpr, _ = roc_curve(y_test, probabilities)
 
-            y_test,
+        roc_auc = auc(fpr, tpr)
 
-            probabilities
+        metrics["roc_auc"] = roc_auc
 
-        )
+        plt.figure(figsize=(6, 6))
 
-        roc_auc = auc(
+        plt.plot(fpr, tpr, linewidth=2, label=f"AUC = {roc_auc:.3f}")
 
-            fpr,
-
-            tpr
-
-        )
-
-        plt.figure(figsize=(6,6))
-
-        plt.plot(
-
-            fpr,
-
-            tpr,
-
-            linewidth=2,
-
-            label=f"AUC = {roc_auc:.3f}"
-
-        )
-
-        plt.plot(
-
-            [0,1],
-
-            [0,1],
-
-            linestyle="--"
-
-        )
+        plt.plot([0, 1], [0, 1], linestyle="--")
 
         plt.xlabel("False Positive Rate")
 
@@ -287,61 +249,26 @@ class TypographicEvaluator:
 
         plt.title("ROC Curve")
 
-        plt.legend(
-
-            loc="lower right"
-
-        )
+        plt.legend(loc="lower right")
 
         plt.tight_layout()
 
-        plt.savefig(
+        roc_path = FEATURE_OUTPUT / "roc_curve.png"
 
-            FEATURE_OUTPUT /
+        plt.savefig(roc_path, dpi=300)
 
-            "roc_curve.png",
+        plt.close()
 
-            dpi=300
+        logger.info("ROC AUC Score: %.4f", roc_auc)
 
+        logger.info(
+            "Saved files:\n%s\n%s\n%s",
+            cm_path,
+            fi_path,
+            roc_path,
         )
 
-        plt.show()
-
-        print("\n====================================")
-        print("ROC AUC Score")
-        print("====================================")
-
-        print(
-
-            f"AUC : {roc_auc:.4f}"
-
-        )
-
-        print("\nSaved Files")
-
-        print(
-
-            FEATURE_OUTPUT /
-
-            "confusion_matrix.png"
-
-        )
-
-        print(
-
-            FEATURE_OUTPUT /
-
-            "feature_importance.png"
-
-        )
-
-        print(
-
-            FEATURE_OUTPUT /
-
-            "roc_curve.png"
-
-        )
+        return metrics
 
 
 ############################################################
