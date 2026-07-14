@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Downloaded/generated model files (large, shouldn't go on GitHub)
+models/dit_finetuned/
+
+# Large datasets (optional - see note below)
+datasets/stego/
+
+# macOS junk files
+.DS_Store
