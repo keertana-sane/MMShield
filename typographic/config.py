@@ -61,7 +61,38 @@ PROJECT_ROOT: Path = (
 
 DATASET_PATH: Path = PROJECT_ROOT / "datasets" / "SROIE" / "SROIE2019"
 
-TRAIN_IMAGES: Path = DATASET_PATH / "train" / "img"
+
+def get_dataset_images(dataset: str) -> Path:
+    """
+    Returns the image directory for the requested dataset.
+    """
+
+    dataset = dataset.lower()
+
+    if dataset == "sroie":
+        return PROJECT_ROOT / "datasets" / "SROIE" / "SROIE2019" / "train" / "img"
+
+    elif dataset == "cord":
+        return PROJECT_ROOT / "datasets" / "CORD" / "test" / "image"
+
+    elif dataset == "funsd":
+      return (
+        PROJECT_ROOT
+        / "datasets"
+        / "FUNSD"
+        / "dataset"
+        / "testing_data"
+        / "images"
+      )
+
+    raise ValueError(f"Unknown dataset: {dataset}")
+
+
+# Single source of truth: TRAIN_IMAGES is just the SROIE case of
+# get_dataset_images, not an independently hardcoded path. Previously
+# these were two separate literals that could silently drift apart if
+# only one was edited.
+TRAIN_IMAGES: Path = get_dataset_images("sroie")
 
 TEST_IMAGES: Path = DATASET_PATH / "test" / "img"
 

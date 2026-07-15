@@ -42,9 +42,21 @@ class ReceiptDatasetBuilder:
     attacked (label=1) images.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, dataset: str = "sroie") -> None:
+        """
+        Args:
+            dataset: Which dataset's attack images to pull, matching
+                the subfolder convention attack_generator.py writes
+                to (ATTACK_OUTPUT / dataset). Clean images always come
+                from TRAIN_IMAGES (SROIE), since that's the only
+                dataset with a defined "clean training split" in this
+                project; dataset only controls which attack subfolder
+                is read.
+        """
 
         logger.info("Initializing modules...")
+
+        self.dataset = dataset
 
         self.ocr = OCRExtractor()
 
@@ -54,14 +66,14 @@ class ReceiptDatasetBuilder:
 
         self.receipt_builder = ReceiptFeatureBuilder()
 
-        self.dataset: list[dict[str, Any]] = []
+        self.rows: list[dict[str, Any]] = []
 
     ######################################################
 
     def process_receipt(self, image_path: Path, label: int) -> bool:
         """
         Extracts, aggregates, and appends one receipt's feature
-        vector to self.dataset.
+        vector to self.rows.
 
         Args:
             image_path: Path to the receipt image.
@@ -112,7 +124,7 @@ class ReceiptDatasetBuilder:
 
             receipt_features["label"] = label
 
-            self.dataset.append(receipt_features)
+            self.rows.append(receipt_features)
 
             return True
 
@@ -160,12 +172,14 @@ class ReceiptDatasetBuilder:
 
             clean_images = clean_images[:max_clean]
 
-        attack_images = sorted(ATTACK_OUTPUT.glob("*.jpg"))
+        attack_folder = ATTACK_OUTPUT / self.dataset
+
+        attack_images = sorted(attack_folder.glob("*.jpg"))
 
         if not attack_images:
 
             logger.warning(
-                "No attack images found under %s.", ATTACK_OUTPUT
+                "No attack images found under %s.", attack_folder
             )
 
         if max_attack is not None:
@@ -196,7 +210,7 @@ class ReceiptDatasetBuilder:
 
                 skipped_attack += 1
 
-        df = pd.DataFrame(self.dataset)
+        df = pd.DataFrame(self.rows)
 
         output_path = FEATURE_OUTPUT / "receipt_dataset.csv"
 
@@ -238,12 +252,12 @@ class ReceiptDatasetBuilder:
 
 if __name__ == "__main__":
 
-    builder = ReceiptDatasetBuilder()
+    builder = ReceiptDatasetBuilder(dataset="sroie")
 
     builder.build_dataset(
 
-        max_clean=56,
+        max_clean=200,
 
-        max_attack=56
+        max_attack=None
 
     )

@@ -20,7 +20,7 @@ from PIL import ImageFont
 
 from ocr import OCRExtractor
 from prompts import PROMPTS
-from config import TRAIN_IMAGES
+from config import get_dataset_images
 from config import ATTACK_OUTPUT
 from config import METADATA_OUTPUT
 
@@ -52,16 +52,20 @@ class TypographicAttackGenerator:
     by overlaying adversarial prompt text onto clean receipt images.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, dataset: str = "sroie") -> None:
+        self.dataset = dataset
+
+        self.input_folder = get_dataset_images(dataset)
+
+        self.output_folder = ATTACK_OUTPUT / dataset
+        self.output_folder.mkdir(parents=True, exist_ok=True)
+
+        self.metadata_file = (
+        METADATA_OUTPUT /
+        f"{dataset}_attack_metadata.csv"
+        )
 
         self.ocr = OCRExtractor()
-
-        self.output_folder: Path = ATTACK_OUTPUT
-
-        self.metadata_file: Path = (
-            METADATA_OUTPUT /
-            "attack_metadata.csv"
-        )
 
         self.colors: list[tuple[int, int, int]] = [
 
@@ -549,17 +553,18 @@ class TypographicAttackGenerator:
 
         random.seed(random_seed)
 
-        images = sorted(
+        images = []
 
-            TRAIN_IMAGES.glob("*.jpg")
+        for extension in ("*.jpg", "*.jpeg", "*.png"):
+          images.extend(self.input_folder.glob(extension))
 
-        )
+        images = sorted(images)
 
         if not images:
 
             logger.warning(
                 "No source images found under %s. Nothing to generate.",
-                TRAIN_IMAGES,
+                self.input_folder,
             )
 
         if max_images is not None:
@@ -707,15 +712,26 @@ def main() -> None:
     parser.add_argument(
 
         "--seed",
+        
         type=int,
         default=42,
         help="Random seed for reproducible attack generation (default: 42)."
 
     )
 
+    parser.add_argument(
+       "--dataset",
+       type=str,
+       default="sroie",
+       choices=["sroie", "cord", "funsd"],
+       help="Dataset to generate attacks for."
+    )
+
     args = parser.parse_args()
 
-    generator = TypographicAttackGenerator()
+    generator = TypographicAttackGenerator(
+    dataset=args.dataset
+)
 
     generator.generate_dataset(
 
