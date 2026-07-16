@@ -1,11 +1,19 @@
 """
 Typographic Model Trainer
 
-Trains a Random Forest classifier on the receipt-level feature dataset
-(receipt_dataset.csv, produced by build_receipt_dataset.py) to
+Trains a Random Forest classifier on the full receipt-level training
+feature set (receipt_dataset_combined_train.csv, produced by
+build_receipt_dataset.py's build_multi_dataset(split="train")) to
 distinguish clean receipts (label=0) from typographic prompt-injection
 attack receipts (label=1). Saves the trained model to
-typographic_model.pkl for use by evaluate.py and predict.py.
+typographic_model.pkl.
+
+This script performs NO internal train/test split. The project has a
+dedicated, official held-out test set
+(receipt_dataset_combined_test.csv), so every row of the training CSV
+is used for fitting the model. All accuracy/precision/recall/F1/ROC
+evaluation happens exclusively in evaluate.py against that separate
+test set.
 """
 
 import logging
@@ -15,8 +23,6 @@ import joblib
 import pandas as pd
 
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
 
 from config import FEATURE_OUTPUT
 
@@ -33,13 +39,14 @@ __all__ = ["TypographicTrainer"]
 
 MODEL_OUTPUT: Path = FEATURE_OUTPUT / "typographic_model.pkl"
 
-_DROP_COLUMNS: tuple[str, ...] = ("image_name", "label")
+_DROP_COLUMNS: tuple[str, ...] = ("image_name", "dataset", "label")
 
 
 class TypographicTrainer:
     """
     Trains and persists a Random Forest classifier for typographic
-    prompt-injection attack detection.
+    prompt-injection attack detection, using the full official
+    training split (no internal holdout).
     """
 
     def __init__(self) -> None:
@@ -58,23 +65,25 @@ class TypographicTrainer:
 
     def load_dataset(self) -> pd.DataFrame:
         """
-        Loads the receipt-level feature dataset.
+        Loads the combined multi-dataset training feature set.
 
         Returns:
             The loaded DataFrame.
 
         Raises:
-            FileNotFoundError: If receipt_dataset.csv does not exist
-                (i.e. build_receipt_dataset.py has not been run yet).
+            FileNotFoundError: If receipt_dataset_combined_train.csv
+                does not exist (i.e. build_receipt_dataset.py's
+                build_multi_dataset() has not been run yet).
         """
 
-        dataset_path = FEATURE_OUTPUT / "receipt_dataset.csv"
+        dataset_path = FEATURE_OUTPUT / "receipt_dataset_combined_train.csv"
 
         if not dataset_path.is_file():
 
             raise FileNotFoundError(
                 f"Dataset not found at '{dataset_path}'. Run "
-                "build_receipt_dataset.py first."
+                "build_receipt_dataset.py (build_multi_dataset, "
+                "split='train') first."
             )
 
         logger.info("Loading dataset: %s", dataset_path)
@@ -89,7 +98,8 @@ class TypographicTrainer:
             )
 
         missing_columns = [
-            col for col in _DROP_COLUMNS if col not in df.columns
+            col for col in ("image_name", "label")
+            if col not in df.columns
         ]
 
         if missing_columns:
@@ -106,83 +116,68 @@ class TypographicTrainer:
 
     def prepare_data(self, df: pd.DataFrame):
         """
-        Splits the dataset into stratified train/test sets.
+        Splits the training DataFrame into feature matrix X and
+        label vector y. No train/test split is performed here — the
+        project uses a separate, dedicated test CSV
+        (receipt_dataset_combined_test.csv) evaluated by evaluate.py.
 
         Args:
-            df: The full receipt-level dataset.
+            df: The full training dataset.
 
         Returns:
-            X_train, X_test, y_train, y_test.
+            X, y.
 
         Raises:
-            ValueError: If either class has fewer than 2 samples
-                (stratified split is impossible).
+            ValueError: If either class has fewer than 1 sample.
         """
 
-        X = df.drop(columns=list(_DROP_COLUMNS))
+        drop_cols = [c for c in _DROP_COLUMNS if c in df.columns]
+
+        X = df.drop(columns=drop_cols)
 
         y = df["label"]
 
         class_counts = y.value_counts()
 
-        if (class_counts < 2).any():
+        if (class_counts < 1).any():
 
             raise ValueError(
-                "Each class needs at least 2 samples for a stratified "
-                f"train/test split. Got class counts: "
-                f"{class_counts.to_dict()}"
+                "Each class needs at least 1 sample to train. Got "
+                f"class counts: {class_counts.to_dict()}"
             )
 
-        return train_test_split(
-
-            X,
-
-            y,
-
-            test_size=0.2,
-
-            random_state=42,
-
-            stratify=y
-
-        )
+        return X, y
 
     #####################################################
 
-    def train(self) -> float:
+    def train(self) -> None:
         """
-        Loads data, trains the Random Forest, evaluates holdout
-        accuracy, and saves the model to MODEL_OUTPUT.
+        Loads the official training data, fits the Random Forest on
+        the full set, and saves the model to MODEL_OUTPUT.
 
-        Returns:
-            Holdout accuracy score.
+        No accuracy is computed or returned here — evaluate.py is
+        responsible for all metrics, against the dedicated held-out
+        test CSV.
         """
 
         df = self.load_dataset()
 
-        X_train, X_test, y_train, y_test = self.prepare_data(df)
+        X, y = self.prepare_data(df)
 
-        logger.info("Training Random Forest...")
+        logger.info(
+            "Training Random Forest on %d samples (label "
+            "distribution: %s)...",
+            len(df),
+            y.value_counts().to_dict(),
+        )
 
-        self.model.fit(X_train, y_train)
-
-        predictions = self.model.predict(X_test)
-
-        accuracy = accuracy_score(y_test, predictions)
-
-        logger.info("=" * 40)
-
-        logger.info("Accuracy : %.4f", accuracy)
-
-        logger.info("=" * 40)
+        self.model.fit(X, y)
 
         MODEL_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
 
         joblib.dump(self.model, MODEL_OUTPUT)
 
         logger.info("Model saved: %s", MODEL_OUTPUT)
-
-        return accuracy
 
 
 ##########################################################

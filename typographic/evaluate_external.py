@@ -103,26 +103,15 @@ class ExternalDataset:
 # which writes generated attacks to ATTACK_OUTPUT / self.dataset.
 DATASETS: tuple[ExternalDataset, ...] = (
 
-    
     ExternalDataset(
         name="CORD",
-        clean_dir=get_dataset_images("cord"),
+        clean_dir=get_dataset_images("cord", split="test"),
         attack_dir=ATTACK_OUTPUT / "cord",
     ),
 
     ExternalDataset(
         name="FUNSD",
-        # NOTE: config.get_dataset_images("funsd") points at
-        # training_data/images. This evaluation deliberately uses the
-        # held-out testing_data/images split instead, per spec.
-        clean_dir=(
-            PROJECT_ROOT
-            / "datasets"
-            / "FUNSD"
-            / "dataset"
-            / "testing_data"
-            / "images"
-        ),
+        clean_dir=get_dataset_images("funsd", split="test"),
         attack_dir=ATTACK_OUTPUT / "funsd",
     ),
 

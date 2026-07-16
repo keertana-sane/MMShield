@@ -3,8 +3,17 @@ Typographic Attack Generator
 
 Generates synthetic typographic prompt-injection attacks on receipt
 images by overlaying adversarial text onto empty regions (or, if none
-are found, the bottom margin) of clean SROIE receipt images. Used to
-build the "attack" class of the MMShield typographic detection dataset.
+are found, the bottom margin) of clean receipt images. Used to build
+the "attack" class of the MMShield typographic detection dataset.
+
+Multi-dataset + split support:
+    Attacks can now be generated per dataset AND per split
+    (train/test), so the official train/test separation established
+    in config.DATASETS is preserved all the way through to attack
+    images. Output is written to
+    ATTACK_OUTPUT / <dataset> / <split>, and metadata to
+    <dataset>_<split>_attack_metadata.csv, so train and test attack
+    sets never share a folder or overwrite each other's metadata.
 """
 
 import argparse
@@ -49,20 +58,23 @@ _METADATA_FIELDNAMES: tuple[str, ...] = (
 class TypographicAttackGenerator:
     """
     Generates a dataset of typographic prompt-injection attack images
-    by overlaying adversarial prompt text onto clean receipt images.
+    by overlaying adversarial prompt text onto clean receipt images,
+    for a specific dataset + split.
     """
 
-    def __init__(self, dataset: str = "sroie") -> None:
+    def __init__(self, dataset: str = "sroie", split: str = "train") -> None:
         self.dataset = dataset
 
-        self.input_folder = get_dataset_images(dataset)
+        self.split = split
 
-        self.output_folder = ATTACK_OUTPUT / dataset
+        self.input_folder = get_dataset_images(dataset, split)
+
+        self.output_folder = ATTACK_OUTPUT / dataset / split
         self.output_folder.mkdir(parents=True, exist_ok=True)
 
         self.metadata_file = (
         METADATA_OUTPUT /
-        f"{dataset}_attack_metadata.csv"
+        f"{dataset}_{split}_attack_metadata.csv"
         )
 
         self.ocr = OCRExtractor()
@@ -538,8 +550,8 @@ class TypographicAttackGenerator:
     ) -> None:
         """
         Generates attacked variants for every clean receipt image
-        under TRAIN_IMAGES and writes a metadata CSV summarizing every
-        generated attack.
+        under this generator's input_folder (dataset + split) and
+        writes a metadata CSV summarizing every generated attack.
 
         Args:
             num_attacks: Number of attack variants to generate per
@@ -573,8 +585,10 @@ class TypographicAttackGenerator:
 
         logger.info(
 
-            "Generating attacks for %d receipts...",
-            len(images)
+            "Generating attacks for %d receipts (%s / %s)...",
+            len(images),
+            self.dataset,
+            self.split,
 
         )
 
@@ -727,10 +741,19 @@ def main() -> None:
        help="Dataset to generate attacks for."
     )
 
+    parser.add_argument(
+       "--split",
+       type=str,
+       default="train",
+       choices=["train", "test"],
+       help="Which split's clean images to attack (default: train)."
+    )
+
     args = parser.parse_args()
 
     generator = TypographicAttackGenerator(
-    dataset=args.dataset
+    dataset=args.dataset,
+    split=args.split,
 )
 
     generator.generate_dataset(
