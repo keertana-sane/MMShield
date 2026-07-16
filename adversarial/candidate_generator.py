@@ -14,6 +14,18 @@ passed downstream to feature extraction and classification.
 This module performs no attack generation and no reference-image
 comparison; it only analyzes intrinsic visual statistics of a single
 input image.
+
+Multi-dataset + split support:
+    CandidateGenerator itself is dataset-agnostic — process_image() and
+    process_directory() operate on whatever image_dir is passed in.
+    However, output_patches_dir and candidates_csv_path now default to
+    dataset/split-specific paths (PATHS.candidates_patches_dir /
+    dataset / split, PATHS.candidates_dir /
+    f"candidates_{dataset}_{split}.csv") when dataset/split are
+    provided, so that generating candidates for multiple
+    datasets/splits does not overwrite a single shared patches folder
+    or CSV — mirroring the leakage-prevention fix already applied to
+    attack_generator.py.
 """
 
 from __future__ import annotations
@@ -104,6 +116,8 @@ class CandidateGenerator:
 
     def __init__(
         self,
+        dataset: Optional[str] = None,
+        split: Optional[str] = None,
         output_patches_dir: Optional[Path] = None,
         candidates_csv_path: Optional[Path] = None,
     ) -> None:
@@ -111,13 +125,41 @@ class CandidateGenerator:
         Initialize the CandidateGenerator.
 
         Args:
+            dataset: Optional dataset name (e.g. "sroie", "cord",
+                "funsd"), used only to build dataset/split-specific
+                default output paths. Not used for image discovery —
+                pass the actual image directory to process_directory().
+            split: Optional split name ("train" or "test"), used only
+                to build dataset/split-specific default output paths.
             output_patches_dir: Directory to save cropped candidate
-                patches. Defaults to PATHS.candidates_patches_dir.
+                patches. Defaults to PATHS.candidates_patches_dir if
+                dataset/split are not given, or
+                PATHS.candidates_patches_dir / dataset / split if they
+                are.
             candidates_csv_path: CSV path to save candidate metadata.
-                Defaults to PATHS.candidates_csv.
+                Defaults to PATHS.candidates_csv if dataset/split are
+                not given, or
+                PATHS.candidates_dir / f"candidates_{dataset}_{split}.csv"
+                if they are.
         """
-        self.output_patches_dir = output_patches_dir or PATHS.candidates_patches_dir
-        self.candidates_csv_path = candidates_csv_path or PATHS.candidates_csv
+        self.dataset = dataset
+        self.split = split
+
+        if output_patches_dir is not None:
+            self.output_patches_dir = output_patches_dir
+        elif dataset is not None and split is not None:
+            self.output_patches_dir = PATHS.candidates_patches_dir / dataset / split
+        else:
+            self.output_patches_dir = PATHS.candidates_patches_dir
+
+        if candidates_csv_path is not None:
+            self.candidates_csv_path = candidates_csv_path
+        elif dataset is not None and split is not None:
+            self.candidates_csv_path = (
+                PATHS.candidates_dir / f"candidates_{dataset}_{split}.csv"
+            )
+        else:
+            self.candidates_csv_path = PATHS.candidates_csv
 
         weight_sum = sum(CANDIDATE_GEN.score_weights.values())
         if not np.isclose(weight_sum, 1.0, atol=1e-3):
@@ -558,12 +600,36 @@ class CandidateGenerator:
 
 
 def main() -> None:
-    """Entry point for running candidate generation standalone over the
-    generated attacks directory."""
+    """Entry point for running candidate generation standalone over a
+    specific dataset's generated attacks directory."""
+    import argparse
+
     _configure_logging()
     ensure_directories()
-    generator = CandidateGenerator()
-    generator.process_directory(PATHS.generated_attacks_images_dir)
+
+    parser = argparse.ArgumentParser(
+        description="Generate candidate suspicious regions from a directory of images."
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="sroie",
+        choices=["sroie", "cord", "funsd"],
+        help="Dataset whose generated attack images to process.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        choices=["train", "test"],
+        help="Which split's generated attack images to process (default: train).",
+    )
+    args = parser.parse_args()
+
+    image_dir = PATHS.generated_attacks_images_dir / args.dataset / args.split
+
+    generator = CandidateGenerator(dataset=args.dataset, split=args.split)
+    generator.process_directory(image_dir)
 
 
 if __name__ == "__main__":

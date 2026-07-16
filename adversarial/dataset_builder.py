@@ -6,25 +6,41 @@ Dataset assembly module for the Patch Integrity Module.
 Merges the fused feature table (receipt_features.py output), the
 candidate region metadata (candidate_generator.py output), and the
 ground-truth patch metadata (attack_generator.py output) into a single
-labeled dataset, then performs a stratified 80/10/10 train/validation/test
-split.
+labeled dataset for one dataset + split.
 
 Labeling strategy: a candidate region is labeled positive (1) if it
 sufficiently overlaps (by IoU) with the ground-truth patch bounding box
 recorded for its source attacked image. Candidates from clean images, or
 candidates that do not overlap any ground-truth patch, are labeled
 negative (0).
+
+Multi-dataset support:
+    build_multi_dataset() merges labeled candidates across several
+    datasets (SROIE, CORD, FUNSD) for a single official split
+    (train or test) into one combined CSV, mirroring the typographic
+    module's build_receipt_dataset.py. There is NO internal
+    train/validation/test re-split here: the official per-dataset
+    train/test boundaries (config.DATASETS) are preserved end to end.
+    Model selection among candidate model types (random_forest,
+    xgboost, svm) is expected to happen via TRAINING.cv_folds
+    cross-validation on the combined train CSV in train.py, not via a
+    held-out validation split carved out here.
+
+    Per-dataset-per-split input files are read from the naming
+    conventions established upstream:
+        features:  PATHS.features_dir / f"receipt_features_{dataset}_{split}.csv"
+        candidates: PATHS.candidates_dir / f"candidates_{dataset}_{split}.csv"
+        attack metadata: PATHS.generated_attacks_dir / f"{dataset}_{split}_metadata.csv"
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 
 from config import PATHS, NAMING, SPLIT, LOGGING, ensure_directories
 
@@ -56,20 +72,23 @@ def _configure_logging() -> None:
 class DatasetBuilder:
     """
     Merges features, candidate metadata, and ground-truth attack metadata
-    into a single labeled dataset, and produces stratified train,
-    validation, and test splits.
+    into a single labeled dataset, for one dataset + split.
 
     Attributes:
+        dataset: Dataset name (e.g. "sroie", "cord", "funsd").
+        split: Split name ("train" or "test").
         features_csv: Path to the fused feature table CSV
-            (receipt_features.py output).
+            (receipt_features.py output) for this dataset + split.
         candidates_csv: Path to the candidate region metadata CSV
-            (candidate_generator.py output).
+            (candidate_generator.py output) for this dataset + split.
         attack_metadata_csv: Path to the ground-truth patch metadata CSV
-            (attack_generator.py output).
+            (attack_generator.py output) for this dataset + split.
     """
 
     def __init__(
         self,
+        dataset: str = "sroie",
+        split: str = "train",
         features_csv: Optional[Path] = None,
         candidates_csv: Optional[Path] = None,
         attack_metadata_csv: Optional[Path] = None,
@@ -78,19 +97,27 @@ class DatasetBuilder:
         Initialize the DatasetBuilder.
 
         Args:
+            dataset: Dataset name this builder assembles data for.
+            split: Split name ("train" or "test") this builder assembles
+                data for.
             features_csv: Path to the fused feature CSV. Defaults to
-                PATHS.features_dir / "receipt_features.csv".
+                PATHS.features_dir / f"receipt_features_{dataset}_{split}.csv".
             candidates_csv: Path to the candidate metadata CSV. Defaults
-                to PATHS.candidates_csv.
+                to PATHS.candidates_dir / f"candidates_{dataset}_{split}.csv".
             attack_metadata_csv: Path to the attack metadata CSV. Defaults
-                to PATHS.generated_attacks_metadata_csv.
+                to PATHS.generated_attacks_dir / f"{dataset}_{split}_metadata.csv".
         """
+        self.dataset = dataset
+        self.split = split
+
         self.features_csv = features_csv or (
-            PATHS.features_dir / "receipt_features.csv"
+            PATHS.features_dir / f"receipt_features_{dataset}_{split}.csv"
         )
-        self.candidates_csv = candidates_csv or PATHS.candidates_csv
-        self.attack_metadata_csv = (
-            attack_metadata_csv or PATHS.generated_attacks_metadata_csv
+        self.candidates_csv = candidates_csv or (
+            PATHS.candidates_dir / f"candidates_{dataset}_{split}.csv"
+        )
+        self.attack_metadata_csv = attack_metadata_csv or (
+            PATHS.generated_attacks_dir / f"{dataset}_{split}_metadata.csv"
         )
 
     @staticmethod
@@ -214,11 +241,14 @@ class DatasetBuilder:
     def merge(self) -> pd.DataFrame:
         """
         Load and merge the feature table, candidate metadata, and
-        ground-truth metadata into a single labeled dataset.
+        ground-truth metadata into a single labeled dataset for this
+        dataset + split.
 
         Returns:
             pd.DataFrame: The merged, labeled dataset, one row per
-            candidate patch.
+            candidate patch. Includes a "dataset" column identifying
+            which source dataset each row came from, so per-dataset
+            performance can be broken out later during evaluation.
 
         Raises:
             FileNotFoundError: If any required input CSV is missing.
@@ -251,90 +281,90 @@ class DatasetBuilder:
             how="inner",
         ).drop(columns=["_patch_stem"])
 
+        merged["dataset"] = self.dataset
+
         logger.info(
-            "Merged dataset: %d rows, %d positive, %d negative",
+            "Merged dataset (%s/%s): %d rows, %d positive, %d negative",
+            self.dataset,
+            self.split,
             len(merged),
             int((merged[SPLIT.label_column] == SPLIT.positive_label).sum()),
             int((merged[SPLIT.label_column] == SPLIT.negative_label).sum()),
         )
         return merged
 
-    def split(
-        self, dataset: pd.DataFrame
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """
-        Perform a stratified 80/10/10 train/validation/test split on the
-        merged, labeled dataset.
 
-        Args:
-            dataset: The merged, labeled dataset.
+def build_multi_dataset(datasets: List[str], split: str) -> pd.DataFrame:
+    """
+    Builds and merges labeled datasets across multiple datasets for a
+    given official split, writing the combined result to
+    PATHS.get_combined_dataset_csv(split).
 
-        Returns:
-            Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: The train,
-            validation, and test splits, respectively.
-        """
-        labels = dataset[SPLIT.stratify_column]
+    No train/validation/test re-split is performed here — the official
+    per-dataset train/test boundaries (config.DATASETS) are preserved.
+    Each dataset is processed by its own DatasetBuilder, and rows carry
+    a "dataset" column so per-dataset performance can be broken out
+    later in evaluate.py.
 
-        train_df, remainder_df = train_test_split(
-            dataset,
-            train_size=SPLIT.train_fraction,
-            stratify=labels,
-            random_state=42,
-        )
+    Args:
+        datasets: Dataset names to include, e.g. ["sroie", "cord",
+            "funsd"]. Each must have upstream features/candidates/attack
+            metadata CSVs already generated for this split.
+        split: "train" or "test".
 
-        remainder_labels = remainder_df[SPLIT.stratify_column]
-        relative_val_fraction = SPLIT.validation_fraction / (
-            SPLIT.validation_fraction + SPLIT.test_fraction
-        )
+    Returns:
+        pd.DataFrame: The combined, labeled dataset.
+    """
+    ensure_directories()
 
-        validation_df, test_df = train_test_split(
-            remainder_df,
-            train_size=relative_val_fraction,
-            stratify=remainder_labels,
-            random_state=42,
-        )
+    frames = []
 
+    for name in datasets:
+        logger.info("=== Building %s / %s ===", name, split)
+
+        builder = DatasetBuilder(dataset=name, split=split)
+
+        try:
+            df = builder.merge()
+        except FileNotFoundError as exc:
+            logger.warning(
+                "Skipping %s/%s: %s", name, split, exc
+            )
+            continue
+
+        frames.append(df)
+
+    combined = (
+        pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    )
+
+    output_path = PATHS.get_combined_dataset_csv(split)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(output_path, index=False)
+
+    logger.info("Combined dataset saved to: %s", output_path)
+    logger.info("Total rows: %d", len(combined))
+
+    if not combined.empty:
         logger.info(
-            "Split sizes -> train: %d, validation: %d, test: %d",
-            len(train_df),
-            len(validation_df),
-            len(test_df),
+            "Label distribution:\n%s",
+            combined[SPLIT.label_column].value_counts().to_string(),
         )
-        return train_df, validation_df, test_df
-
-    def build(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """
-        Run the full dataset assembly pipeline: merge features, metadata,
-        and labels, split into train/validation/test, and save the
-        resulting CSV files.
-
-        Returns:
-            Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]: The train,
-            validation, and test splits, respectively.
-        """
-        ensure_directories()
-        merged = self.merge()
-        train_df, validation_df, test_df = self.split(merged)
-
-        PATHS.train_csv.parent.mkdir(parents=True, exist_ok=True)
-        train_df.to_csv(PATHS.train_csv, index=False)
-        validation_df.to_csv(PATHS.validation_csv, index=False)
-        test_df.to_csv(PATHS.test_csv, index=False)
-
         logger.info(
-            "Dataset splits written to %s, %s, %s",
-            PATHS.train_csv,
-            PATHS.validation_csv,
-            PATHS.test_csv,
+            "Per-dataset counts:\n%s",
+            combined["dataset"].value_counts().to_string(),
         )
-        return train_df, validation_df, test_df
+
+    return combined
 
 
 def main() -> None:
-    """Entry point for running dataset assembly standalone."""
+    """Entry point for running dataset assembly standalone across all
+    three training datasets, for both the train and test splits."""
     _configure_logging()
-    builder = DatasetBuilder()
-    builder.build()
+
+    build_multi_dataset(datasets=["sroie", "cord", "funsd"], split="train")
+    build_multi_dataset(datasets=["sroie", "cord", "funsd"], split="test")
 
 
 if __name__ == "__main__":

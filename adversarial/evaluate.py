@@ -3,10 +3,17 @@ evaluate.py
 
 Evaluation module for the Patch Integrity Module.
 
-Loads the trained best model and the held-out test split, computes a full
-suite of classification metrics (accuracy, precision, recall, specificity,
-F1, ROC-AUC), and generates and saves the confusion matrix, ROC curve,
+Loads the trained best model and the OFFICIAL held-out test split
+(patch_dataset_combined_test.csv, produced by dataset_builder.py's
+build_multi_dataset(split="test")), computes a full suite of
+classification metrics (accuracy, precision, recall, specificity, F1,
+ROC-AUC), and generates and saves the confusion matrix, ROC curve,
 precision-recall curve, and a text classification report.
+
+This is the ONLY place in the patch module where held-out
+generalization metrics are computed — train.py's cross-validation
+results are for model selection only and must not be treated as a
+substitute for this evaluation.
 """
 
 from __future__ import annotations
@@ -65,7 +72,8 @@ def _configure_logging() -> None:
 @dataclass
 class EvaluationMetrics:
     """
-    Full set of classification metrics computed on the test split.
+    Full set of classification metrics computed on the official test
+    split.
 
     Attributes:
         accuracy: Overall accuracy.
@@ -97,23 +105,25 @@ class EvaluationMetrics:
 
 class ModelEvaluator:
     """
-    Evaluates a trained classifier on the held-out test split, producing
-    both scalar metrics and saved diagnostic figures.
+    Evaluates a trained classifier on the official held-out test split,
+    producing both scalar metrics and saved diagnostic figures.
 
     Attributes:
         model: The trained classifier loaded from disk.
-        scaler: The StandardScaler fit during training.
+        scaler: The StandardScaler fit during training (on the full
+            training set, in train.py's fit_final_model).
         feature_columns: The ordered list of feature column names expected
             by the model.
     """
 
     NON_FEATURE_COLUMNS = (
-    "image_id",
-    "image_id_x",
-    "image_id_y",
-    "label",
-    "candidate_rank",
-    "threat_score",
+        "image_id",
+        "image_id_x",
+        "image_id_y",
+        "label",
+        "candidate_rank",
+        "threat_score",
+        "dataset",
     )
 
     def __init__(self, model_path: Optional[Path] = None) -> None:
@@ -144,11 +154,12 @@ class ModelEvaluator:
 
     def _load_test_split(self, test_csv: Optional[Path] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Load and scale the test split feature matrix and label vector.
+        Load and scale the official test split feature matrix and label
+        vector.
 
         Args:
             test_csv: Path to the test split CSV. Defaults to
-                PATHS.test_csv.
+                PATHS.get_combined_dataset_csv("test").
 
         Returns:
             Tuple[np.ndarray, np.ndarray]: (scaled feature matrix, label
@@ -157,7 +168,7 @@ class ModelEvaluator:
         Raises:
             FileNotFoundError: If the test split CSV does not exist.
         """
-        test_csv = test_csv or PATHS.test_csv
+        test_csv = test_csv or PATHS.get_combined_dataset_csv("test")
         if not test_csv.exists():
             raise FileNotFoundError(f"Test split not found: {test_csv}")
 
@@ -372,9 +383,9 @@ class ModelEvaluator:
 
     def run(self) -> EvaluationMetrics:
         """
-        Run the full evaluation pipeline: load the test split, generate
-        predictions, compute metrics, and save all diagnostic figures and
-        reports.
+        Run the full evaluation pipeline: load the official test split,
+        generate predictions, compute metrics, and save all diagnostic
+        figures and reports.
 
         Returns:
             EvaluationMetrics: The computed metrics on the test split.
@@ -394,7 +405,7 @@ class ModelEvaluator:
 
 
 def main() -> None:
-    """Entry point for running evaluation standalone on the test split."""
+    """Entry point for running evaluation standalone on the official test split."""
     _configure_logging()
     evaluator = ModelEvaluator()
     evaluator.run()

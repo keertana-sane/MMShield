@@ -9,6 +9,16 @@ gradient statistics, and color statistics -- computed directly from each
 candidate patch image, into a single flat feature vector per patch. The
 resulting vectors are the input representation used for classifier
 training in train.py.
+
+Multi-dataset + split support:
+    ReceiptFeatureFuser itself is dataset-agnostic — compute_*_features
+    and fuse_features operate purely on whatever image is passed in.
+    However, process_directory()'s default output_csv now depends on
+    dataset/split (PATHS.features_dir /
+    f"receipt_features_{dataset}_{split}.csv") when they are provided,
+    so fusing features for multiple datasets/splits does not overwrite
+    a single shared CSV — mirroring the fix already applied to
+    attack_generator.py and candidate_generator.py.
 """
 
 from __future__ import annotations
@@ -285,7 +295,11 @@ class ReceiptFeatureFuser:
         return combined
 
     def process_directory(
-        self, image_dir: Path, output_csv: Optional[Path] = None
+        self,
+        image_dir: Path,
+        output_csv: Optional[Path] = None,
+        dataset: Optional[str] = None,
+        split: Optional[str] = None,
     ) -> pd.DataFrame:
         """
         Compute fused features for every valid image in a directory and
@@ -293,8 +307,16 @@ class ReceiptFeatureFuser:
 
         Args:
             image_dir: Directory containing candidate patch images.
-            output_csv: Path to write the combined features CSV. Defaults
-                to PATHS.features_dir / "receipt_features.csv".
+            output_csv: Path to write the combined features CSV. If not
+                given, defaults to PATHS.features_dir /
+                "receipt_features.csv" when dataset/split are not
+                provided, or PATHS.features_dir /
+                f"receipt_features_{dataset}_{split}.csv" when they are.
+            dataset: Optional dataset name (e.g. "sroie", "cord",
+                "funsd"), used only to build the default output_csv
+                path. Not used for image discovery.
+            split: Optional split name ("train" or "test"), used only
+                to build the default output_csv path.
 
         Returns:
             pd.DataFrame: The fused feature table, one row per image.
@@ -306,7 +328,15 @@ class ReceiptFeatureFuser:
             raise FileNotFoundError(f"Image directory not found: {image_dir}")
 
         ensure_directories()
-        output_csv = output_csv or (PATHS.features_dir / "receipt_features.csv")
+
+        if output_csv is not None:
+            resolved_output_csv = output_csv
+        elif dataset is not None and split is not None:
+            resolved_output_csv = (
+                PATHS.features_dir / f"receipt_features_{dataset}_{split}.csv"
+            )
+        else:
+            resolved_output_csv = PATHS.features_dir / "receipt_features.csv"
 
         image_paths = sorted(
             p for p in image_dir.iterdir() if p.suffix.lower() in IMAGE.valid_extensions
@@ -316,7 +346,7 @@ class ReceiptFeatureFuser:
         if not image_paths:
             logger.warning("No images found in %s; nothing to fuse.", image_dir)
             empty_df = pd.DataFrame()
-            empty_df.to_csv(output_csv, index=False)
+            empty_df.to_csv(resolved_output_csv, index=False)
             return empty_df
 
         cnn_embeddings, cnn_ids = self.cnn_extractor.extract_batch(image_paths)
@@ -337,12 +367,12 @@ class ReceiptFeatureFuser:
                 logger.warning("Skipping image %s: %s", image_path, exc)
 
         df = pd.DataFrame(rows)
-        output_csv.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(output_csv, index=False)
+        resolved_output_csv.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(resolved_output_csv, index=False)
 
         logger.info(
             "Fused feature table written to %s (%d rows, %d columns)",
-            output_csv,
+            resolved_output_csv,
             df.shape[0],
             df.shape[1],
         )
@@ -350,12 +380,36 @@ class ReceiptFeatureFuser:
 
 
 def main() -> None:
-    """Entry point for running feature fusion standalone over the
-    generated candidate patches directory."""
+    """Entry point for running feature fusion standalone over a specific
+    dataset's candidate patches directory."""
+    import argparse
+
     _configure_logging()
     ensure_directories()
+
+    parser = argparse.ArgumentParser(
+        description="Fuse CNN + handcrafted features for candidate patches."
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="sroie",
+        choices=["sroie", "cord", "funsd"],
+        help="Dataset whose candidate patches to fuse features for.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        choices=["train", "test"],
+        help="Which split's candidate patches to process (default: train).",
+    )
+    args = parser.parse_args()
+
+    image_dir = PATHS.candidates_patches_dir / args.dataset / args.split
+
     fuser = ReceiptFeatureFuser()
-    fuser.process_directory(PATHS.candidates_patches_dir)
+    fuser.process_directory(image_dir, dataset=args.dataset, split=args.split)
 
 
 if __name__ == "__main__":

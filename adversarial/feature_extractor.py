@@ -8,6 +8,15 @@ pretrained EfficientNet-B0 backbone (PyTorch). Extraction runs in batches
 on GPU when available, falling back to CPU otherwise. Resulting embeddings
 are saved as .npy files, one per input image (or optionally stacked into
 a single array), for downstream fusion with handcrafted features.
+
+Note on the multi-dataset pipeline:
+    receipt_features.py calls CNNFeatureExtractor.extract_batch()
+    directly and fuses embeddings in-memory — it does NOT go through
+    process_directory() here. process_directory() and this module's
+    standalone main() exist only as an independent debugging/inspection
+    entry point (e.g. to precompute and inspect raw .npy embeddings for
+    a specific dataset/split's candidate patches) and are not part of
+    the dataset_builder.py pipeline.
 """
 
 from __future__ import annotations
@@ -127,22 +136,19 @@ class CNNFeatureExtractor:
         )
 
     @staticmethod
-    @staticmethod
     def _select_device() -> torch.device:
-    
+        for preferred in CNN.device_preference:
 
-     for preferred in CNN.device_preference:
+            if preferred == "mps" and torch.backends.mps.is_available():
+                return torch.device("mps")
 
-        if preferred == "mps" and torch.backends.mps.is_available():
-            return torch.device("mps")
+            if preferred == "cuda" and torch.cuda.is_available():
+                return torch.device("cuda")
 
-        if preferred == "cuda" and torch.cuda.is_available():
-            return torch.device("cuda")
+            if preferred == "cpu":
+                return torch.device("cpu")
 
-        if preferred == "cpu":
-            return torch.device("cpu")
-
-     return torch.device("cpu")
+        return torch.device("cpu")
 
     @staticmethod
     def _build_model() -> nn.Module:
@@ -160,7 +166,7 @@ class CNNFeatureExtractor:
         if CNN.backbone != "efficientnet_b0":
             raise ValueError(
                 f"Unsupported backbone '{CNN.backbone}'. "
-                "Only 'efficientnet_b0' is currently implemented."
+                f"Only 'efficientnet_b0' is currently implemented."
             )
 
         weights = (
@@ -303,12 +309,39 @@ class CNNFeatureExtractor:
 
 
 def main() -> None:
-    """Entry point for running CNN feature extraction standalone over the
-    generated candidate patches directory."""
+    """Entry point for running CNN feature extraction standalone over a
+    specific dataset/split's candidate patches directory (debugging /
+    inspection only — not used by the dataset_builder.py pipeline,
+    which calls extract_batch() directly via receipt_features.py)."""
+    import argparse
+
     _configure_logging()
     ensure_directories()
+
+    parser = argparse.ArgumentParser(
+        description="Precompute and save CNN embeddings for a directory of candidate patches."
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="sroie",
+        choices=["sroie", "cord", "funsd"],
+        help="Dataset whose candidate patches to extract embeddings for.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        choices=["train", "test"],
+        help="Which split's candidate patches to process (default: train).",
+    )
+    args = parser.parse_args()
+
+    image_dir = PATHS.candidates_patches_dir / args.dataset / args.split
+    output_dir = PATHS.features_dir / "cnn_embeddings" / args.dataset / args.split
+
     extractor = CNNFeatureExtractor()
-    extractor.process_directory(PATHS.candidates_patches_dir)
+    extractor.process_directory(image_dir, output_dir=output_dir)
 
 
 if __name__ == "__main__":

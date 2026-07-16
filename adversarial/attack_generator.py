@@ -4,10 +4,22 @@ attack_generator.py
 Synthetic patch dataset generator for the Patch Integrity Module.
 
 This module composites transparent PNG patches onto clean base images
-(SROIE receipts) using randomized geometric and photometric transformations
-(location, size, rotation, opacity, brightness, contrast, perspective warp,
-gaussian blur). It produces a labeled dataset of clean/attacked image pairs
-along with metadata describing exactly how each patch was applied.
+using randomized geometric and photometric transformations (location,
+size, rotation, opacity, brightness, contrast, perspective warp,
+gaussian blur). It produces a labeled dataset of clean/attacked image
+pairs along with metadata describing exactly how each patch was applied.
+
+Multi-dataset + split support:
+    Base images are now sourced from config.get_dataset_images(dataset,
+    split) instead of being hardcoded to PATHS.sroie_dir. This lets the
+    same generator be pointed at SROIE, CORD, or FUNSD, and at either
+    the train or test split, without code changes. Output images are
+    written to PATHS.generated_attacks_images_dir / dataset / split,
+    and metadata to
+    PATHS.generated_attacks_dir / f"{dataset}_{split}_metadata.csv",
+    so train and test attack sets never share a folder or overwrite
+    each other's metadata (mirroring the typographic module's
+    train/test separation).
 
 IMPORTANT: This module does NOT implement TRAP, SmoothPrompt, DPATCH, or any
 adversarial optimization algorithm. It performs synthetic, randomized visual
@@ -37,6 +49,7 @@ from config import (
     PATCH_GEN,
     NAMING,
     LOGGING,
+    get_dataset_images,
     ensure_directories,
 )
 
@@ -110,7 +123,7 @@ class PatchDatasetGenerator:
     """
     Generates a synthetic dataset of patched (positive) images from a
     directory of clean base images and a library of transparent PNG
-    patches.
+    patches, for a specific dataset + split.
 
     The generator applies randomized geometric transformations (scale,
     rotation, perspective warp) and photometric transformations (opacity,
@@ -121,8 +134,11 @@ class PatchDatasetGenerator:
     ground-truth bounding boxes for downstream training and evaluation.
 
     Attributes:
-        base_image_dir: Directory containing clean base images (SROIE
-            receipts).
+        dataset: Which dataset this generator draws base images from
+            (e.g. "sroie", "cord", "funsd").
+        split: Which split ("train" or "test") this generator draws
+            base images from.
+        base_image_dir: Directory containing clean base images.
         patch_library_dir: Directory containing transparent PNG patch
             assets.
         output_dir: Directory where attacked images are written.
@@ -132,6 +148,8 @@ class PatchDatasetGenerator:
 
     def __init__(
         self,
+        dataset: str = "sroie",
+        split: str = "train",
         base_image_dir: Optional[Path] = None,
         patch_library_dir: Optional[Path] = None,
         output_dir: Optional[Path] = None,
@@ -142,20 +160,35 @@ class PatchDatasetGenerator:
         Initialize the PatchDatasetGenerator.
 
         Args:
+            dataset: Which dataset to draw clean base images from. Must
+                be a key in config.DATASETS ("sroie", "cord", "funsd").
+            split: "train" or "test". Selects which clean-image split to
+                read from config.DATASETS[dataset].
             base_image_dir: Directory of clean base images. Defaults to
-                PATHS.sroie_dir.
+                get_dataset_images(dataset, split). Overriding this
+                bypasses the dataset/split registry entirely.
             patch_library_dir: Directory of transparent PNG patches.
                 Defaults to PATHS.patch_library_dir.
             output_dir: Directory to write attacked images. Defaults to
-                PATHS.generated_attacks_images_dir.
+                PATHS.generated_attacks_images_dir / dataset / split.
             metadata_path: CSV path to write metadata. Defaults to
-                PATHS.generated_attacks_metadata_csv.
+                PATHS.generated_attacks_dir /
+                f"{dataset}_{split}_metadata.csv".
             seed: Random seed for reproducibility.
         """
-        self.base_image_dir = base_image_dir or PATHS.sroie_dir
+        self.dataset = dataset
+        self.split = split
+
+        self.base_image_dir = base_image_dir or get_dataset_images(dataset, split)
         self.patch_library_dir = patch_library_dir or PATHS.patch_library_dir
-        self.output_dir = output_dir or PATHS.generated_attacks_images_dir
-        self.metadata_path = metadata_path or PATHS.generated_attacks_metadata_csv
+        self.output_dir = (
+            output_dir
+            or PATHS.generated_attacks_images_dir / dataset / split
+        )
+        self.metadata_path = (
+            metadata_path
+            or PATHS.generated_attacks_dir / f"{dataset}_{split}_metadata.csv"
+        )
 
         self.rng = random.Random(seed)
         np.random.seed(seed)
@@ -163,25 +196,25 @@ class PatchDatasetGenerator:
         self._patch_file_cache: Optional[List[Path]] = None
 
     def _discover_base_images(self) -> List[Path]:
-    
-     if not self.base_image_dir.exists():
-        raise FileNotFoundError(
-            f"Base image directory not found: {self.base_image_dir}"
+        if not self.base_image_dir.exists():
+            raise FileNotFoundError(
+                f"Base image directory not found: {self.base_image_dir}"
+            )
+
+        images = sorted(
+            p
+            for p in self.base_image_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in IMAGE.valid_extensions
         )
 
-     images = sorted(
-        p
-        for p in self.base_image_dir.rglob("*")
-        if p.is_file() and p.suffix.lower() in IMAGE.valid_extensions
-     )
+        logger.info(
+            "Discovered %d base images in %s",
+            len(images),
+            self.base_image_dir,
+        )
 
-     logger.info(
-        "Discovered %d base images in %s",
-        len(images),
-        self.base_image_dir,
-    )
+        return images
 
-     return images
     def _discover_patch_files(self) -> List[Path]:
         """
         Scan `patch_library_dir` for transparent PNG patch assets.
@@ -485,13 +518,6 @@ class PatchDatasetGenerator:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         base_images = self._discover_base_images()
-        # --------------------------------------------------
-        # Limit dataset size during development
-        # --------------------------------------------------
-        MAX_IMAGES = 100      # Change to None for full dataset
-
-        if MAX_IMAGES is not None:
-           base_images = base_images[:MAX_IMAGES]
         patch_files = self._discover_patch_files()
 
         if not base_images:
@@ -500,7 +526,10 @@ class PatchDatasetGenerator:
 
         records: List[PatchRecord] = []
 
-        for base_path in tqdm(base_images, desc="Generating Patch Dataset"):
+        for base_path in tqdm(
+            base_images,
+            desc=f"Generating Patch Dataset ({self.dataset}/{self.split})",
+        ):
             try:
                 base_image = Image.open(base_path).convert("RGB")
             except Exception as exc:
@@ -615,8 +644,30 @@ class PatchDatasetGenerator:
 
 def main() -> None:
     """Entry point for running the synthetic patch dataset generator standalone."""
+    import argparse
+
     _configure_logging()
-    generator = PatchDatasetGenerator()
+
+    parser = argparse.ArgumentParser(
+        description="Generate a synthetic adversarial-patch dataset."
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="sroie",
+        choices=["sroie", "cord", "funsd"],
+        help="Dataset to generate patch attacks for.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        choices=["train", "test"],
+        help="Which split's clean images to attack (default: train).",
+    )
+    args = parser.parse_args()
+
+    generator = PatchDatasetGenerator(dataset=args.dataset, split=args.split)
     generator.process_dataset()
 
 
