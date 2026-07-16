@@ -2,10 +2,13 @@
 Typographic Model Evaluator
 
 Loads the trained Random Forest model (typographic_model.pkl) and the
-receipt-level dataset, evaluates it on a held-out stratified test
-split, and produces accuracy/precision/recall/F1, a confusion matrix,
-feature importances, and an ROC curve — saving each plot under
-FEATURE_OUTPUT.
+official held-out test feature set
+(receipt_dataset_combined_test.csv, produced by
+build_receipt_dataset.py's build_multi_dataset(split="test")),
+evaluates it on the FULL test set (no internal re-split), and
+produces accuracy/precision/recall/F1, a confusion matrix, feature
+importances (if the model exposes them), and an ROC curve — saving
+each plot under FEATURE_OUTPUT.
 """
 
 import logging
@@ -26,8 +29,6 @@ from sklearn.metrics import (
     auc,
 )
 
-from sklearn.model_selection import train_test_split
-
 from config import FEATURE_OUTPUT
 
 
@@ -43,12 +44,13 @@ __all__ = ["TypographicEvaluator"]
 
 MODEL_PATH: Path = FEATURE_OUTPUT / "typographic_model.pkl"
 
-_DROP_COLUMNS: tuple[str, ...] = ("image_name", "label")
+_DROP_COLUMNS: tuple[str, ...] = ("image_name", "dataset", "label")
 
 
 class TypographicEvaluator:
     """
-    Evaluates the trained typographic attack-detection model.
+    Evaluates the trained typographic attack-detection model against
+    the full official held-out test set.
     """
 
     def __init__(self) -> None:
@@ -67,25 +69,27 @@ class TypographicEvaluator:
 
     def load_dataset(self) -> pd.DataFrame:
         """
-        Loads the receipt-level feature dataset and records feature
+        Loads the official test feature set and records feature
         column names.
 
         Returns:
             The loaded DataFrame.
 
         Raises:
-            FileNotFoundError: If receipt_dataset.csv is missing.
+            FileNotFoundError: If receipt_dataset_combined_test.csv
+                is missing.
             ValueError: If the dataset is empty or missing required
                 columns.
         """
 
-        dataset_path = FEATURE_OUTPUT / "receipt_dataset.csv"
+        dataset_path = FEATURE_OUTPUT / "receipt_dataset_combined_test.csv"
 
         if not dataset_path.is_file():
 
             raise FileNotFoundError(
                 f"Dataset not found at '{dataset_path}'. Run "
-                "build_receipt_dataset.py first."
+                "build_receipt_dataset.py (build_multi_dataset, "
+                "split='test') first."
             )
 
         df = pd.read_csv(dataset_path)
@@ -95,7 +99,8 @@ class TypographicEvaluator:
             raise ValueError(f"Dataset at '{dataset_path}' is empty.")
 
         missing_columns = [
-            col for col in _DROP_COLUMNS if col not in df.columns
+            col for col in ("image_name", "label")
+            if col not in df.columns
         ]
 
         if missing_columns:
@@ -104,9 +109,9 @@ class TypographicEvaluator:
                 f"Dataset is missing required column(s) {missing_columns}."
             )
 
-        self.feature_names = list(
-            df.drop(columns=list(_DROP_COLUMNS)).columns
-        )
+        drop_cols = [c for c in _DROP_COLUMNS if c in df.columns]
+
+        self.feature_names = list(df.drop(columns=drop_cols).columns)
 
         return df
 
@@ -114,8 +119,9 @@ class TypographicEvaluator:
 
     def evaluate(self) -> dict[str, float]:
         """
-        Runs the full evaluation: metrics, confusion matrix, feature
-        importance, and ROC curve, saving each plot to disk.
+        Runs the full evaluation on the entire official test set:
+        metrics, confusion matrix, feature importance (if available),
+        and ROC curve, saving each plot to disk.
 
         Returns:
             Dict of accuracy, precision, recall, f1, and roc_auc.
@@ -123,32 +129,26 @@ class TypographicEvaluator:
 
         df = self.load_dataset()
 
-        X = df.drop(columns=list(_DROP_COLUMNS))
+        drop_cols = [c for c in _DROP_COLUMNS if c in df.columns]
 
-        y = df["label"]
+        X_test = df.drop(columns=drop_cols)
 
-        class_counts = y.value_counts()
+        y_test = df["label"]
 
-        if (class_counts < 2).any():
+        class_counts = y_test.value_counts()
+
+        if len(class_counts) != 2:
 
             raise ValueError(
-                "Each class needs at least 2 samples for a stratified "
-                f"train/test split. Got class counts: "
+                "Official test dataset must contain both classes "
+                "(0 = safe, 1 = attack). Got class counts: "
                 f"{class_counts.to_dict()}"
             )
 
-        X_train, X_test, y_train, y_test = train_test_split(
-
-            X,
-
-            y,
-
-            test_size=0.2,
-
-            random_state=42,
-
-            stratify=y
-
+        logger.info(
+            "Evaluating on %d test samples (label distribution: %s)...",
+            len(df),
+            class_counts.to_dict(),
         )
 
         predictions = self.model.predict(X_test)
@@ -194,38 +194,51 @@ class TypographicEvaluator:
         plt.close()
 
         ########################################################
-        # Feature Importance
+        # Feature Importance (model-dependent)
         ########################################################
 
-        importance = self.model.feature_importances_
+        if hasattr(self.model, "feature_importances_"):
 
-        feature_importance = pd.DataFrame({
-            "Feature": self.feature_names,
-            "Importance": importance,
-        }).sort_values(by="Importance", ascending=False)
+            importance = self.model.feature_importances_
 
-        logger.info("Top 10 Important Features:\n%s",
-                     feature_importance.head(10).to_string(index=False))
+            feature_importance = pd.DataFrame({
+                "Feature": self.feature_names,
+                "Importance": importance,
+            }).sort_values(by="Importance", ascending=False)
 
-        top10 = feature_importance.head(10)
+            logger.info(
+                "Top 10 Important Features:\n%s",
+                feature_importance.head(10).to_string(index=False),
+            )
 
-        plt.figure(figsize=(10, 6))
+            top10 = feature_importance.head(10)
 
-        plt.barh(top10["Feature"][::-1], top10["Importance"][::-1])
+            plt.figure(figsize=(10, 6))
 
-        plt.xlabel("Importance Score")
+            plt.barh(top10["Feature"][::-1], top10["Importance"][::-1])
 
-        plt.ylabel("Feature")
+            plt.xlabel("Importance Score")
 
-        plt.title("Top 10 Random Forest Feature Importances")
+            plt.ylabel("Feature")
 
-        plt.tight_layout()
+            plt.title("Top 10 Random Forest Feature Importances")
 
-        fi_path = FEATURE_OUTPUT / "feature_importance.png"
+            plt.tight_layout()
 
-        plt.savefig(fi_path, dpi=300)
+            fi_path = FEATURE_OUTPUT / "feature_importance.png"
 
-        plt.close()
+            plt.savefig(fi_path, dpi=300)
+
+            plt.close()
+
+        else:
+
+            fi_path = None
+
+            logger.info(
+                "Feature importance unavailable for model type %s",
+                type(self.model).__name__,
+            )
 
         ########################################################
         # ROC Curve
@@ -261,12 +274,9 @@ class TypographicEvaluator:
 
         logger.info("ROC AUC Score: %.4f", roc_auc)
 
-        logger.info(
-            "Saved files:\n%s\n%s\n%s",
-            cm_path,
-            fi_path,
-            roc_path,
-        )
+        saved_files = [cm_path, roc_path] + ([fi_path] if fi_path else [])
+
+        logger.info("Saved files:\n%s", "\n".join(str(p) for p in saved_files))
 
         return metrics
 

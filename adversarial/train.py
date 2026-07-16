@@ -4,10 +4,30 @@ train.py
 Model training module for the Patch Integrity Module.
 
 Trains three candidate classifiers -- Random Forest, XGBoost, and Support
-Vector Machine -- on the fused feature dataset produced by
-dataset_builder.py, compares them on the validation split using accuracy,
-precision, recall, F1, and ROC-AUC, and automatically persists the
-best-performing model to disk.
+Vector Machine -- on the official combined training feature dataset
+produced by dataset_builder.py (patch_dataset_combined_train.csv),
+compares them using stratified k-fold cross-validation (accuracy,
+precision, recall, F1, ROC-AUC), selects the best according to
+TRAINING.selection_metric, refits the winner on the FULL training set,
+and persists it to disk.
+
+This module performs NO internal train/validation/test split. The
+project uses official per-dataset train/test boundaries
+(config.DATASETS), so there is no separate validation CSV to evaluate
+against here. Model selection uses TRAINING.cv_folds cross-validation
+on the training data alone. All held-out generalization metrics are
+computed exclusively by evaluate.py against the official combined test
+CSV (patch_dataset_combined_test.csv).
+
+Cross-validation leakage note:
+    Feature scaling is fit INSIDE each cross-validation fold via an
+    sklearn Pipeline(StandardScaler -> classifier), not once on the
+    full training set beforehand. This ensures CV-estimated metrics
+    used for model selection are not inflated by the scaler having
+    already seen validation-fold statistics. The final persisted model
+    (after the winning model type is selected) is fit with a scaler
+    trained on the FULL training set, since at that point there is no
+    more held-out data within this file to leak into.
 """
 
 from __future__ import annotations
@@ -24,13 +44,8 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    roc_auc_score,
-)
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import StratifiedKFold, cross_validate
 from xgboost import XGBClassifier
 
 from config import PATHS, SPLIT, TRAINING, LOGGING, ensure_directories
@@ -60,19 +75,24 @@ def _configure_logging() -> None:
     )
 
 
+_CV_SCORING = ("accuracy", "precision", "recall", "f1", "roc_auc")
+
+
 @dataclass
 class ModelResult:
     """
-    Evaluation results for a single trained candidate model.
+    Cross-validated evaluation results for a single candidate model,
+    computed on the training set only (no held-out test data is used
+    for model selection).
 
     Attributes:
         model_name: Name of the candidate model ("random_forest",
             "xgboost", or "svm").
-        accuracy: Accuracy on the validation split.
-        precision: Precision on the validation split.
-        recall: Recall on the validation split.
-        f1: F1 score on the validation split.
-        roc_auc: ROC-AUC on the validation split.
+        accuracy: Mean cross-validated accuracy across TRAINING.cv_folds.
+        precision: Mean cross-validated precision.
+        recall: Mean cross-validated recall.
+        f1: Mean cross-validated F1 score.
+        roc_auc: Mean cross-validated ROC-AUC.
     """
 
     model_name: str
@@ -96,25 +116,31 @@ class ModelResult:
 
 class ModelTrainer:
     """
-    Trains and compares Random Forest, XGBoost, and SVM classifiers on the
-    Patch Integrity feature dataset, selecting and persisting the
-    best-performing model according to a configurable selection metric.
+    Trains and compares Random Forest, XGBoost, and SVM classifiers on
+    the Patch Integrity feature dataset via leakage-free cross-validation
+    (scaler refit per fold) on the official training split, selecting
+    and persisting the best-performing model according to a configurable
+    selection metric.
 
     Attributes:
-        non_feature_columns: Columns present in the dataset CSVs that are
-            identifiers or labels rather than model input features, and
-            are excluded from the feature matrix.
-        scaler: A StandardScaler fit on the training features, used to
-            normalize inputs for all candidate models (in particular SVM).
+        NON_FEATURE_COLUMNS: Columns present in the dataset CSVs that
+            are identifiers, labels, or provenance metadata rather than
+            model input features, and are excluded from the feature
+            matrix.
+        scaler: A StandardScaler fit on the full training features
+            during the FINAL fit only (not used during cross-validated
+            model selection), used to normalize inputs for the
+            persisted model (in particular SVM).
     """
 
     NON_FEATURE_COLUMNS = (
-    "image_id",
-    "image_id_x",
-    "image_id_y",
-    "label",
-    "candidate_rank",
-    "threat_score",
+        "image_id",
+        "image_id_x",
+        "image_id_y",
+        "label",
+        "candidate_rank",
+        "threat_score",
+        "dataset",
     )
 
     def __init__(self) -> None:
@@ -133,7 +159,7 @@ class ModelTrainer:
         a label vector.
 
         Args:
-            csv_path: Path to the split CSV (train/validation/test).
+            csv_path: Path to the split CSV.
 
         Returns:
             Tuple[np.ndarray, np.ndarray]: (feature matrix, label vector).
@@ -159,53 +185,53 @@ class ModelTrainer:
         y = df[SPLIT.label_column].to_numpy(dtype=np.int32)
         return X, y
 
-    def load_datasets(
+    def load_dataset(
         self,
         train_csv: Optional[Path] = None,
-        validation_csv: Optional[Path] = None,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Load the train and validation splits, fitting the feature scaler
-        on the training data only.
+        Load the official combined training split as RAW (unscaled)
+        features. Scaling is deliberately NOT applied here: during
+        cross-validation, scaling happens inside each fold via a
+        Pipeline (see cross_validate_model), and during the final fit,
+        scaling happens in fit_final_model on the full training set.
+        Fitting a single scaler on the full set here, before CV, would
+        leak validation-fold statistics into every fold's training
+        step.
 
         Args:
-            train_csv: Path to the training split CSV. Defaults to
-                PATHS.train_csv.
-            validation_csv: Path to the validation split CSV. Defaults to
-                PATHS.validation_csv.
+            train_csv: Path to the combined training CSV. Defaults to
+                PATHS.get_combined_dataset_csv("train").
 
         Returns:
-            Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-            (X_train_scaled, y_train, X_val_scaled, y_val).
+            Tuple[np.ndarray, np.ndarray]: (X_train_raw, y_train).
         """
-        train_csv = train_csv or PATHS.train_csv
-        validation_csv = validation_csv or PATHS.validation_csv
+        train_csv = train_csv or PATHS.get_combined_dataset_csv("train")
 
         X_train, y_train = self._load_split(train_csv)
-        X_val, y_val = self._load_split(validation_csv)
-
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_val_scaled = self.scaler.transform(X_val)
 
         logger.info(
-            "Loaded datasets -> train: %s, validation: %s, features: %d",
-            X_train_scaled.shape,
-            X_val_scaled.shape,
+            "Loaded training set -> %s, features: %d, label distribution: %s",
+            X_train.shape,
             len(self.feature_columns),
+            dict(zip(*np.unique(y_train, return_counts=True))),
         )
-        return X_train_scaled, y_train, X_val_scaled, y_val
+        return X_train, y_train
 
     # ------------------------------------------------------------------
     # Model construction
     # ------------------------------------------------------------------
 
-    def _build_model(self, model_name: str):
+    def _build_model(self, model_name: str, y_train: Optional[np.ndarray] = None):
         """
         Instantiate a candidate model by name using its configured
         hyperparameters.
 
         Args:
             model_name: One of "random_forest", "xgboost", "svm".
+            y_train: Training label vector, used only to compute
+                XGBoost's scale_pos_weight from the class imbalance.
+                Required when model_name == "xgboost".
 
         Returns:
             A scikit-learn-compatible estimator instance.
@@ -220,7 +246,13 @@ class ModelTrainer:
           **TRAINING.random_forest_params
         )
         elif model_name == "xgboost":
-            return XGBClassifier(random_state=42, **TRAINING.xgboost_params)
+            model = XGBClassifier(random_state=42, **TRAINING.xgboost_params)
+            if y_train is not None:
+                positives = np.sum(y_train == 1)
+                negatives = np.sum(y_train == 0)
+                if positives > 0:
+                    model.set_params(scale_pos_weight=negatives / positives)
+            return model
         elif model_name == "svm":
           return SVC(
           random_state=42,
@@ -231,70 +263,62 @@ class ModelTrainer:
             raise ValueError(f"Unrecognized model name: {model_name}")
 
     # ------------------------------------------------------------------
-    # Training and evaluation
+    # Cross-validated model selection
     # ------------------------------------------------------------------
 
-    def train_model(self, model_name: str, X_train: np.ndarray, y_train: np.ndarray):
+    def cross_validate_model(
+        self, model_name: str, X_train: np.ndarray, y_train: np.ndarray
+    ) -> ModelResult:
         """
-        Train a single candidate model.
+        Cross-validate a single candidate model on the training set using
+        TRAINING.cv_folds stratified folds. Scaling is performed INSIDE
+        a Pipeline so StandardScaler is refit on each fold's training
+        portion only, preventing scaler leakage from validation folds.
 
         Args:
             model_name: One of "random_forest", "xgboost", "svm".
-            X_train: Scaled training feature matrix.
+            X_train: RAW (unscaled) training feature matrix.
             y_train: Training label vector.
 
         Returns:
-            The fitted model instance.
+            ModelResult: Mean cross-validated metrics for this model.
         """
-        logger.info("Training model: %s", model_name)
+        logger.info(
+            "Cross-validating model: %s (cv_folds=%d)",
+            model_name,
+            TRAINING.cv_folds,
+        )
 
-        model = self._build_model(model_name)
+        base_model = self._build_model(model_name, y_train=y_train)
+        pipeline = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", base_model),
+        ])
 
-        if model_name == "xgboost":
-         positives = np.sum(y_train == 1)
-         negatives = np.sum(y_train == 0)
+        cv = StratifiedKFold(
+            n_splits=TRAINING.cv_folds, shuffle=True, random_state=42
+        )
 
-         model.set_params(
-         scale_pos_weight=negatives / positives
-         )
-
-        model.fit(X_train, y_train)
-
-        return model
-
-    def evaluate_model(
-        self, model_name: str, model, X_val: np.ndarray, y_val: np.ndarray
-    ) -> ModelResult:
-        """
-        Evaluate a trained model on the validation split.
-
-        Args:
-            model_name: Name of the model being evaluated.
-            model: The fitted model instance.
-            X_val: Scaled validation feature matrix.
-            y_val: Validation label vector.
-
-        Returns:
-            ModelResult: The computed evaluation metrics.
-        """
-        y_pred = model.predict(X_val)
-
-        if hasattr(model, "predict_proba"):
-            y_score = model.predict_proba(X_val)[:, 1]
-        else:
-            y_score = model.decision_function(X_val)
+        scores = cross_validate(
+            pipeline,
+            X_train,
+            y_train,
+            cv=cv,
+            scoring=_CV_SCORING,
+            n_jobs=-1,
+        )
 
         result = ModelResult(
             model_name=model_name,
-            accuracy=float(accuracy_score(y_val, y_pred)),
-            precision=float(precision_score(y_val, y_pred, zero_division=0)),
-            recall=float(recall_score(y_val, y_pred, zero_division=0)),
-            f1=float(f1_score(y_val, y_pred, zero_division=0)),
-            roc_auc=float(roc_auc_score(y_val, y_score)),
+            accuracy=float(np.mean(scores["test_accuracy"])),
+            precision=float(np.mean(scores["test_precision"])),
+            recall=float(np.mean(scores["test_recall"])),
+            f1=float(np.mean(scores["test_f1"])),
+            roc_auc=float(np.mean(scores["test_roc_auc"])),
         )
 
         logger.info(
-            "%s -> accuracy=%.4f precision=%.4f recall=%.4f f1=%.4f roc_auc=%.4f",
+            "%s (cv mean) -> accuracy=%.4f precision=%.4f recall=%.4f f1=%.4f roc_auc=%.4f",
             model_name,
             result.accuracy,
             result.precision,
@@ -305,28 +329,24 @@ class ModelTrainer:
         return result
 
     def compare_models(
-        self, X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray, y_val: np.ndarray
+        self, X_train: np.ndarray, y_train: np.ndarray
     ) -> List[ModelResult]:
         """
-        Train and evaluate every candidate model configured in
-        TRAINING.candidate_models.
+        Cross-validate every candidate model configured in
+        TRAINING.candidate_models on the training set.
 
         Args:
-            X_train: Scaled training feature matrix.
+            X_train: RAW (unscaled) training feature matrix.
             y_train: Training label vector.
-            X_val: Scaled validation feature matrix.
-            y_val: Validation label vector.
 
         Returns:
-            List[ModelResult]: Evaluation results for every candidate
-            model, in the order they were trained.
+            List[ModelResult]: Cross-validated results for every
+            candidate model, in the order they were evaluated.
         """
         results: List[ModelResult] = []
 
         for model_name in TRAINING.candidate_models:
-            model = self.train_model(model_name, X_train, y_train)
-            self.trained_models[model_name] = model
-            result = self.evaluate_model(model_name, model, X_val, y_val)
+            result = self.cross_validate_model(model_name, X_train, y_train)
             results.append(result)
 
         return results
@@ -351,12 +371,40 @@ class ModelTrainer:
         metric = TRAINING.selection_metric
         best = max(results, key=lambda r: getattr(r, metric))
         logger.info(
-            "Best model selected: %s (%s=%.4f)",
+            "Best model selected: %s (%s=%.4f, cross-validated)",
             best.model_name,
             metric,
             getattr(best, metric),
         )
         return best
+
+    def fit_final_model(
+        self, model_name: str, X_train: np.ndarray, y_train: np.ndarray
+    ) -> object:
+        """
+        Refit the selected model on the FULL training set (all folds
+        combined). The feature scaler (self.scaler) is fit here, on the
+        full training set — this is the only scaler that gets
+        persisted and later used by evaluate.py/predict.py against
+        genuinely held-out data, so no leakage occurs at this step.
+
+        Args:
+            model_name: Name of the selected best model.
+            X_train: RAW (unscaled) training feature matrix (full set).
+            y_train: Training label vector (full set).
+
+        Returns:
+            The fitted model instance.
+        """
+        logger.info("Refitting %s on the full training set...", model_name)
+
+        X_train_scaled = self.scaler.fit_transform(X_train)
+
+        model = self._build_model(model_name, y_train=y_train)
+        model.fit(X_train_scaled, y_train)
+
+        self.trained_models[model_name] = model
+        return model
 
     def save_model(self, model_name: str, output_path: Optional[Path] = None) -> Path:
         """
@@ -396,17 +444,19 @@ class ModelTrainer:
 
     def save_metadata(self, results: List[ModelResult], best: ModelResult) -> None:
         """
-        Save a JSON summary of all model comparison results and the
-        selected best model to PATHS.model_metadata_json.
+        Save a JSON summary of all cross-validated model comparison
+        results and the selected best model to
+        PATHS.model_metadata_json.
 
         Args:
-            results: All candidate model evaluation results.
+            results: All candidate model cross-validation results.
             best: The selected best-performing result.
         """
         PATHS.model_metadata_json.parent.mkdir(parents=True, exist_ok=True)
 
         metadata = {
             "selection_metric": TRAINING.selection_metric,
+            "cv_folds": TRAINING.cv_folds,
             "best_model": best.model_name,
             "results": [r.as_dict() for r in results],
             "feature_columns": self.feature_columns,
@@ -419,17 +469,21 @@ class ModelTrainer:
 
     def run(self) -> ModelResult:
         """
-        Run the full training pipeline: load data, train and compare all
-        candidate models, select and save the best one.
+        Run the full training pipeline: load the official training set
+        (raw/unscaled), cross-validate and compare all candidate models
+        (scaler refit per fold), select the best by cross-validated
+        selection_metric, refit it on the full training set (scaler fit
+        on the full set here), and save it.
 
         Returns:
-            ModelResult: The evaluation result of the best-performing
-            model.
+            ModelResult: The cross-validated result of the
+            best-performing model.
         """
         ensure_directories()
-        X_train, y_train, X_val, y_val = self.load_datasets()
-        results = self.compare_models(X_train, y_train, X_val, y_val)
+        X_train, y_train = self.load_dataset()
+        results = self.compare_models(X_train, y_train)
         best = self.select_best_model(results)
+        self.fit_final_model(best.model_name, X_train, y_train)
         self.save_model(best.model_name)
         self.save_metadata(results, best)
         return best

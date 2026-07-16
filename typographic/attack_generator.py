@@ -3,8 +3,17 @@ Typographic Attack Generator
 
 Generates synthetic typographic prompt-injection attacks on receipt
 images by overlaying adversarial text onto empty regions (or, if none
-are found, the bottom margin) of clean SROIE receipt images. Used to
-build the "attack" class of the MMShield typographic detection dataset.
+are found, the bottom margin) of clean receipt images. Used to build
+the "attack" class of the MMShield typographic detection dataset.
+
+Multi-dataset + split support:
+    Attacks can now be generated per dataset AND per split
+    (train/test), so the official train/test separation established
+    in config.DATASETS is preserved all the way through to attack
+    images. Output is written to
+    ATTACK_OUTPUT / <dataset> / <split>, and metadata to
+    <dataset>_<split>_attack_metadata.csv, so train and test attack
+    sets never share a folder or overwrite each other's metadata.
 """
 
 import argparse
@@ -20,7 +29,7 @@ from PIL import ImageFont
 
 from ocr import OCRExtractor
 from prompts import PROMPTS
-from config import TRAIN_IMAGES
+from config import get_dataset_images
 from config import ATTACK_OUTPUT
 from config import METADATA_OUTPUT
 
@@ -49,19 +58,26 @@ _METADATA_FIELDNAMES: tuple[str, ...] = (
 class TypographicAttackGenerator:
     """
     Generates a dataset of typographic prompt-injection attack images
-    by overlaying adversarial prompt text onto clean receipt images.
+    by overlaying adversarial prompt text onto clean receipt images,
+    for a specific dataset + split.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, dataset: str = "sroie", split: str = "train") -> None:
+        self.dataset = dataset
+
+        self.split = split
+
+        self.input_folder = get_dataset_images(dataset, split)
+
+        self.output_folder = ATTACK_OUTPUT / dataset / split
+        self.output_folder.mkdir(parents=True, exist_ok=True)
+
+        self.metadata_file = (
+        METADATA_OUTPUT /
+        f"{dataset}_{split}_attack_metadata.csv"
+        )
 
         self.ocr = OCRExtractor()
-
-        self.output_folder: Path = ATTACK_OUTPUT
-
-        self.metadata_file: Path = (
-            METADATA_OUTPUT /
-            "attack_metadata.csv"
-        )
 
         self.colors: list[tuple[int, int, int]] = [
 
@@ -534,8 +550,8 @@ class TypographicAttackGenerator:
     ) -> None:
         """
         Generates attacked variants for every clean receipt image
-        under TRAIN_IMAGES and writes a metadata CSV summarizing every
-        generated attack.
+        under this generator's input_folder (dataset + split) and
+        writes a metadata CSV summarizing every generated attack.
 
         Args:
             num_attacks: Number of attack variants to generate per
@@ -549,17 +565,18 @@ class TypographicAttackGenerator:
 
         random.seed(random_seed)
 
-        images = sorted(
+        images = []
 
-            TRAIN_IMAGES.glob("*.jpg")
+        for extension in ("*.jpg", "*.jpeg", "*.png"):
+          images.extend(self.input_folder.glob(extension))
 
-        )
+        images = sorted(images)
 
         if not images:
 
             logger.warning(
                 "No source images found under %s. Nothing to generate.",
-                TRAIN_IMAGES,
+                self.input_folder,
             )
 
         if max_images is not None:
@@ -568,8 +585,10 @@ class TypographicAttackGenerator:
 
         logger.info(
 
-            "Generating attacks for %d receipts...",
-            len(images)
+            "Generating attacks for %d receipts (%s / %s)...",
+            len(images),
+            self.dataset,
+            self.split,
 
         )
 
@@ -707,15 +726,35 @@ def main() -> None:
     parser.add_argument(
 
         "--seed",
+        
         type=int,
         default=42,
         help="Random seed for reproducible attack generation (default: 42)."
 
     )
 
+    parser.add_argument(
+       "--dataset",
+       type=str,
+       default="sroie",
+       choices=["sroie", "cord", "funsd"],
+       help="Dataset to generate attacks for."
+    )
+
+    parser.add_argument(
+       "--split",
+       type=str,
+       default="train",
+       choices=["train", "test"],
+       help="Which split's clean images to attack (default: train)."
+    )
+
     args = parser.parse_args()
 
-    generator = TypographicAttackGenerator()
+    generator = TypographicAttackGenerator(
+    dataset=args.dataset,
+    split=args.split,
+)
 
     generator.generate_dataset(
 

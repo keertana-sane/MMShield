@@ -11,6 +11,19 @@ and visualization.
 No other module should hardcode paths, thresholds, or settings. Everything
 configurable lives here so that the entire pipeline stays consistent and
 reproducible.
+
+Multi-dataset support
+----------------------
+DATASETS is the single source of truth for every clean-document dataset
+used by the patch module. Each entry provides:
+
+    - clean_train : Path to the training-split image directory
+    - clean_test  : Path to the test/eval-split image directory
+    - image_glob  : Glob pattern used to enumerate images in that dir
+
+PATCH_BENCHMARK_DIR is a separate, external benchmark used for
+evaluation ONLY. It must never be used for training and is not part of
+DATASETS.
 """
 
 from __future__ import annotations
@@ -29,48 +42,101 @@ from typing import Tuple, List
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+# ============================================================================
+# MULTI-DATASET REGISTRY
+# ============================================================================
+
+DATASETS: dict = {
+    "sroie": {
+        "clean_train": PROJECT_ROOT / "datasets" / "SROIE" / "SROIE2019" / "train" / "img",
+        "clean_test": PROJECT_ROOT / "datasets" / "SROIE" / "SROIE2019" / "test" / "img",
+        "image_glob": "*.jpg",
+    },
+    "cord": {
+        "clean_train": PROJECT_ROOT / "datasets" / "CORD" / "train" / "image",
+        "clean_test": PROJECT_ROOT / "datasets" / "CORD" / "test" / "image",
+        "image_glob": "*.png",
+    },
+    "funsd": {
+        "clean_train": PROJECT_ROOT / "datasets" / "FUNSD" / "dataset" / "training_data" / "images",
+        "clean_test": PROJECT_ROOT / "datasets" / "FUNSD" / "dataset" / "testing_data" / "images",
+        "image_glob": "*.png",
+    },
+}
+
+# ============================================================
+# External Benchmark (Evaluation Only)
+# ============================================================
+# PatchBenchmark is an external benchmark used ONLY for
+# evaluate_external.py. It is deliberately excluded from
+# DATASETS so it is never used for training.
+PATCH_BENCHMARK_DIR: Path = PROJECT_ROOT / "datasets" / "PatchBenchmark"
+PATCH_BENCHMARK_IMAGES_DIR: Path = (
+    PATCH_BENCHMARK_DIR / "benchmark_patches"
+)
+# Optional. If no labels exist, evaluate_external.py automatically
+# switches to prediction-only mode.
+PATCH_BENCHMARK_LABELS_CSV: Path = (
+    PATCH_BENCHMARK_DIR / "labels.csv"
+)
+
+
+def get_dataset_images(dataset: str, split: str = "train") -> Path:
+    """
+    Returns the clean image directory for the requested dataset/split.
+
+    Args:
+        dataset: One of the keys in DATASETS ("sroie", "cord", "funsd").
+        split: "train" or "test".
+
+    Returns:
+        Path to the requested clean image directory.
+
+    Raises:
+        ValueError: If dataset or split is not recognized.
+    """
+    dataset = dataset.lower()
+    if dataset not in DATASETS:
+        raise ValueError(f"Unknown dataset: '{dataset}'. Available: {list(DATASETS.keys())}")
+
+    if split not in ("train", "test"):
+        raise ValueError(f"split must be 'train' or 'test', got '{split}'")
+
+    key = "clean_train" if split == "train" else "clean_test"
+    return DATASETS[dataset][key]
+
+
 @dataclass(frozen=True)
 class PathConfig:
     """
     Filesystem layout for the Patch Integrity Module.
 
-    All paths are resolved relative to PROJECT_ROOT. Directories are not
-    created here; each module is responsible for creating the directories
-    it writes to (typically via `Path.mkdir(parents=True, exist_ok=True)`)
-    at the point of first use.
+    All paths are resolved relative to PROJECT_ROOT. Helper methods provide
+    dataset- and split-aware path resolution dynamically with strict parameter validation.
     """
 
     project_root: Path = PROJECT_ROOT
 
-    # Raw source dataset (SROIE receipts).
-    sroie_dir = PROJECT_ROOT / "datasets" / "SROIE" / "SROIE2019" / "train" / "img"
+    # Multi-dataset registry. See module-level DATASETS for the source of truth.
+    datasets: dict = field(default_factory=lambda: DATASETS)
+
+    # External evaluation benchmark (never used for training)
+    patch_benchmark_dir: Path = PATCH_BENCHMARK_DIR
+    patch_benchmark_images_dir: Path = PATCH_BENCHMARK_IMAGES_DIR
+    patch_benchmark_labels_csv: Path = PATCH_BENCHMARK_LABELS_CSV
+
+    # Backward-compatible alias (SROIE train case)
+    sroie_dir = DATASETS["sroie"]["clean_train"]
 
     # Library of transparent PNG patches used as visual modifications.
     patch_library_dir = PROJECT_ROOT / "patches"
 
-    # Synthetic attack generation outputs.
+    # Base directories for artifacts
     generated_attacks_dir: Path = PROJECT_ROOT / "generated_attacks"
     generated_attacks_images_dir: Path = PROJECT_ROOT / "generated_attacks" / "images"
-    generated_attacks_metadata_csv: Path = (
-        PROJECT_ROOT / "generated_attacks" / "metadata.csv"
-    )
-
-    # Candidate region proposal outputs.
     candidates_dir: Path = PROJECT_ROOT / "candidates"
     candidates_patches_dir: Path = PROJECT_ROOT / "candidates" / "patches"
-    candidates_csv: Path = PROJECT_ROOT / "candidates" / "candidates.csv"
-
-    # Extracted feature outputs.
     features_dir: Path = PROJECT_ROOT / "features"
-    train_features_csv: Path = PROJECT_ROOT / "features" / "train_features.csv"
-    validation_features_csv: Path = PROJECT_ROOT / "features" / "validation_features.csv"
-    test_features_csv: Path = PROJECT_ROOT / "features" / "test_features.csv"
-
-    # Dataset split outputs (features + metadata + labels merged).
-    splits_dir: Path = PROJECT_ROOT / "features"
-    train_csv: Path = PROJECT_ROOT / "features" / "train.csv"
-    validation_csv: Path = PROJECT_ROOT / "features" / "validation.csv"
-    test_csv: Path = PROJECT_ROOT / "features" / "test.csv"
 
     # Model artifacts.
     models_dir: Path = PROJECT_ROOT / "models"
@@ -93,14 +159,58 @@ class PathConfig:
     logs_dir: Path = PROJECT_ROOT / "logs"
     log_file: Path = PROJECT_ROOT / "logs" / "patch_module.log"
 
-    def all_output_directories(self) -> List[Path]:
-        """
-        Return every directory that a pipeline stage may need to create
-        before writing files into it.
+    # ========================================================================
+    # Private Validation Helpers
+    # ========================================================================
 
-        Returns:
-            List[Path]: Directories required across the full pipeline.
-        """
+    def _validate_inputs(self, dataset: str, split: str) -> Tuple[str, str]:
+        """Internal utility to ensure path variables belong to runtime limits."""
+        ds_lower = dataset.lower()
+        sp_lower = split.lower()
+        if ds_lower not in DATASETS:
+            raise ValueError(f"Unknown dataset '{dataset}'. Registered choices: {list(DATASETS.keys())}")
+        if sp_lower not in ("train", "test"):
+            raise ValueError(f"Invalid split '{split}'. Expected 'train' or 'test'.")
+        return ds_lower, sp_lower
+
+    # ========================================================================
+    # Dynamic Split-Aware Dataset Path Helpers
+    # ========================================================================
+
+    def get_generated_attacks_dir(self, dataset: str, split: str) -> Path:
+        """Returns the specific subfolder where attacked variant images are stored."""
+        ds, sp = self._validate_inputs(dataset, split)
+        return self.generated_attacks_images_dir / ds / sp
+
+    def get_generated_attacks_metadata_csv(self, dataset: str, split: str) -> Path:
+        """Returns the metadata CSV path mapping transformations for a single split."""
+        ds, sp = self._validate_inputs(dataset, split)
+        return self.generated_attacks_dir / f"{ds}_{sp}_metadata.csv"
+
+    def get_candidates_csv(self, dataset: str, split: str) -> Path:
+        """Returns the candidate bounding box proposal mapping CSV."""
+        ds, sp = self._validate_inputs(dataset, split)
+        return self.candidates_dir / f"candidates_{ds}_{sp}.csv"
+
+    def get_receipt_features_csv(self, dataset: str, split: str) -> Path:
+        """Returns the handcrafted + integrated structural feature vector CSV."""
+        ds, sp = self._validate_inputs(dataset, split)
+        return self.features_dir / f"receipt_features_{ds}_{sp}.csv"
+
+    def get_cnn_embeddings_dir(self, dataset: str, split: str) -> Path:
+        """Returns the storage location for precomputed batch .npy deep embeddings."""
+        ds, sp = self._validate_inputs(dataset, split)
+        return self.features_dir / "cnn_embeddings" / ds / sp
+
+    def get_combined_dataset_csv(self, split: str) -> Path:
+        """Returns the multi-dataset combined file path consumed during training/testing."""
+        sp_lower = split.lower()
+        if sp_lower not in ("train", "test"):
+            raise ValueError(f"Invalid split '{split}'. Expected 'train' or 'test'.")
+        return self.features_dir / f"patch_dataset_combined_{sp_lower}.csv"
+
+    def all_output_directories(self) -> List[Path]:
+        """Return every directory that a pipeline stage may need to create before writing."""
         return [
             self.patch_library_dir,
             self.generated_attacks_dir,
@@ -113,6 +223,8 @@ class PathConfig:
             self.heatmaps_dir,
             self.annotated_dir,
             self.logs_dir,
+            self.patch_benchmark_dir,
+            self.patch_benchmark_images_dir,
         ]
 
 
@@ -127,112 +239,48 @@ class RandomSeedConfig:
 class ImageConfig:
     """Image sizing and I/O settings shared across the pipeline."""
 
-    # Standard size (width, height) that images are resized to before
-    # candidate generation and feature extraction.
     target_size: Tuple[int, int] = (512, 512)
-
-    # Size fed into the CNN feature extractor.
     cnn_input_size: Tuple[int, int] = (224, 224)
-
-    # Valid image file extensions considered when scanning source folders.
     valid_extensions: Tuple[str, ...] = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
-
-    # JPEG quality used when re-saving compressed outputs.
     jpeg_quality: int = 95
 
 
 @dataclass(frozen=True)
 class PatchGenerationConfig:
-    """
-    Settings controlling the synthetic patch dataset generator
-    (attack_generator.py).
+    """Settings controlling the synthetic patch dataset generator."""
 
-    These parameters govern the random transformation ranges applied to
-    each patch composited onto a clean receipt image. This module performs
-    localized visual modification synthesis only; it does not implement
-    any adversarial optimization procedure.
-    """
-
-    # Number of patched (positive) images generated per clean receipt.
     patched_images_per_receipt: int = 5
-
-    # Relative patch size range, expressed as a fraction of the shorter
-    # edge of the base image (min_scale, max_scale).
     patch_scale_range: Tuple[float, float] = (0.08, 0.35)
-
-    # Rotation range in degrees applied to the patch before compositing.
     rotation_range_degrees: Tuple[float, float] = (-30.0, 30.0)
-
-    # Opacity range for alpha blending the patch onto the base image.
     opacity_range: Tuple[float, float] = (0.55, 1.0)
-
-    # Brightness adjustment factor range (1.0 = unchanged).
     brightness_range: Tuple[float, float] = (0.7, 1.3)
-
-    # Contrast adjustment factor range (1.0 = unchanged).
     contrast_range: Tuple[float, float] = (0.7, 1.3)
-
-    # Perspective warp distortion magnitude range, expressed as a fraction
-    # of the patch's own width/height used to jitter its corner points.
     perspective_warp_range: Tuple[float, float] = (0.0, 0.15)
-
-    # Gaussian blur kernel size options (must be odd integers); 0 means
-    # no blur applied.
     gaussian_blur_kernel_choices: Tuple[int, ...] = (0, 3, 5, 7)
-
-    # Severity levels used to bucket the combined strength of the applied
-    # transformations into a categorical label stored in metadata.
     severity_levels: Tuple[str, ...] = ("low", "medium", "high")
-
-    # Attack type labels describing the category of synthetic patch used.
-    # These are descriptive labels for the benchmark, not references to
-    # any specific adversarial optimization algorithm.
     attack_type_labels: Tuple[str, ...] = (
         "overlay_patch",
         "corner_patch",
         "edge_patch",
         "occlusion_patch",
     )
-
-    # Accepted patch library file extension.
     patch_file_extension: str = ".png"
 
 
 @dataclass(frozen=True)
 class CandidateGenerationConfig:
-    """
-    Settings for candidate_generator.py, which locates visually suspicious
-    regions in a single image without access to a clean reference image.
-    """
+    """Settings for candidate_generator.py region mapping."""
 
-    # Number of top-ranked candidate regions retained per image.
     top_k_candidates: int = 3
-
-    # Sliding-window / connected-component minimum area (in pixels) for a
-    # region to be considered a valid candidate.
     min_candidate_area: int = 400
-
-    # Maximum number of connected components considered before ranking,
-    # to bound computation on noisy score maps.
     max_components_considered: int = 50
-
-    # Local entropy filter window size (must be odd).
     entropy_window_size: int = 9
-
-    # LBP (Local Binary Pattern) parameters.
     lbp_num_points: int = 24
     lbp_radius: int = 3
     lbp_method: str = "uniform"
-
-    # Canny edge detection thresholds.
     canny_threshold_low: int = 50
     canny_threshold_high: int = 150
-
-    # Sobel kernel size for gradient magnitude computation.
     sobel_kernel_size: int = 3
-
-    # Weights combining individual score maps into the final threat score
-    # map. Must sum to 1.0.
     score_weights: dict = field(
         default_factory=lambda: {
             "edge_density": 0.20,
@@ -242,13 +290,7 @@ class CandidateGenerationConfig:
             "saliency": 0.20,
         }
     )
-
-    # Threshold applied to the normalized threat score map (0-1) before
-    # connected component extraction.
     threat_score_threshold: float = 0.6
-
-    # Padding (pixels) added around each candidate bounding box when
-    # cropping the patch image for downstream feature extraction.
     candidate_padding: int = 8
 
 
@@ -262,8 +304,6 @@ class CNNConfig:
     batch_size: int = 32
     num_workers: int = 4
     device_preference: Tuple[str, ...] = ("mps", "cuda", "cpu")
-
-    # ImageNet normalization statistics used for CNN preprocessing.
     normalization_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
     normalization_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
 
@@ -284,19 +324,15 @@ class HandcraftedFeatureConfig:
 
 @dataclass(frozen=True)
 class DatasetSplitConfig:
-    """Settings for dataset_builder.py (train/validation/test split)."""
+    """Ground truth assignment parameters for multi-dataset split matching."""
 
-    train_fraction: float = 0.8
-    validation_fraction: float = 0.1
-    test_fraction: float = 0.1
-    stratify_column: str = "label"
     label_column: str = "label"
     positive_label: int = 1
     negative_label: int = 0
-
+    stratify_column: str = "label"
+    
     # Minimum IoU between a candidate region and the ground-truth patch
-    # bounding box (from attack_generator metadata) for that candidate to
-    # be assigned the positive label.
+    # bounding box for that candidate to be assigned the positive label.
     label_iou_threshold: float = 0.3
 
 
@@ -305,7 +341,6 @@ class TrainingConfig:
     """Settings for train.py (model training and comparison)."""
 
     candidate_models: Tuple[str, ...] = ("random_forest", "xgboost", "svm")
-
     random_forest_params: dict = field(
         default_factory=lambda: {
             "n_estimators": 300,
@@ -315,7 +350,6 @@ class TrainingConfig:
             "n_jobs": -1,
         }
     )
-
     xgboost_params: dict = field(
         default_factory=lambda: {
             "n_estimators": 300,
@@ -326,7 +360,6 @@ class TrainingConfig:
             "eval_metric": "logloss",
         }
     )
-
     svm_params: dict = field(
         default_factory=lambda: {
             "C": 1.0,
@@ -335,11 +368,7 @@ class TrainingConfig:
             "probability": True,
         }
     )
-
-    # Metric used to select the best model among candidates.
     selection_metric: str = "f1"
-
-    # Number of cross-validation folds used during model comparison.
     cv_folds: int = 5
 
 
@@ -388,7 +417,6 @@ class FileNamingConfig:
     candidate_rank_column: str = "candidate_rank"
     threat_score_column: str = "threat_score"
     bbox_columns: Tuple[str, ...] = ("bbox_x", "bbox_y", "bbox_width", "bbox_height")
-
     model_file_prefix: str = "model"
     best_model_filename: str = "best_model.pkl"
 
@@ -406,9 +434,6 @@ class LoggingConfig:
 
 # ============================================================================
 # SINGLETON CONFIG INSTANCES
-# ============================================================================
-# Other modules import these instances directly, e.g.:
-#   from config import PATHS, IMAGE, PATCH_GEN
 # ============================================================================
 
 PATHS = PathConfig()
@@ -438,4 +463,4 @@ def ensure_directories() -> None:
 if __name__ == "__main__":
     ensure_directories()
     print(f"Project root: {PATHS.project_root}")
-    print("All configured output directories have been created.")
+    print("All configured split-aware output directories have been verified.")

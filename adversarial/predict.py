@@ -22,7 +22,7 @@ import logging
 import pickle
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -190,6 +190,46 @@ class PatchPredictor:
         )
         return self.scaler.transform(vector)
 
+    @staticmethod
+    def _aggregate_image_prediction(
+        candidate_predictions: List[CandidatePrediction],
+    ) -> Tuple[str, float]:
+        """
+        Aggregate per-candidate predictions into a single image-level
+        decision and confidence score.
+
+        Rule: an image is labeled "attacked" if ANY candidate region was
+        classified as a patch (threat_probability >=
+        EVALUATION.decision_threshold). Confidence is always the maximum
+        threat_probability observed across ALL candidates, regardless of
+        the final label — i.e. it reflects "the highest threat signal
+        found", not "confidence in the clean/attacked decision itself".
+        If there are no candidates at all, the image is "clean" with
+        confidence 0.0.
+
+        This is the single source of truth for image-level aggregation
+        and is reused by evaluate_external.py so PatchBenchmark results
+        are directly comparable to this module's real-world behavior.
+
+        Args:
+            candidate_predictions: Per-candidate prediction results for
+                one image.
+
+        Returns:
+            Tuple[str, float]: (overall_prediction, confidence), where
+            overall_prediction is "attacked" or "clean".
+        """
+        if not candidate_predictions:
+            return "clean", 0.0
+
+        max_confidence = max(c.threat_probability for c in candidate_predictions)
+        overall_prediction = (
+            "attacked"
+            if any(c.is_patch for c in candidate_predictions)
+            else "clean"
+        )
+        return overall_prediction, max_confidence
+
     def predict(self, image_path: Path) -> ImagePrediction:
         """
         Run the full inference pipeline on a single receipt image.
@@ -254,16 +294,9 @@ class PatchPredictor:
                 )
             )
 
-        if candidate_predictions:
-            max_confidence = max(c.threat_probability for c in candidate_predictions)
-            overall_prediction = (
-                "attacked"
-                if any(c.is_patch for c in candidate_predictions)
-                else "clean"
-            )
-        else:
-            max_confidence = 0.0
-            overall_prediction = "clean"
+        overall_prediction, max_confidence = self._aggregate_image_prediction(
+            candidate_predictions
+        )
 
         result = ImagePrediction(
             image_path=str(image_path),
@@ -318,18 +351,56 @@ class PatchPredictor:
 
 def main() -> None:
     """
-    Entry point for running inference on a single test image.
+    Entry point for running inference on a batch of generated attack
+    images for a specific dataset + split.
     """
+    import argparse
     _configure_logging()
     ensure_directories()
 
+    parser = argparse.ArgumentParser(
+        description="Run patch-integrity inference over generated attack images."
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="sroie",
+        choices=["sroie", "cord", "funsd"],
+        help="Dataset whose generated attack images to run inference on.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="test",
+        choices=["train", "test"],
+        help="Which split's generated attack images to process (default: test).",
+    )
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=100,
+        help="Maximum number of images to process (default: 100). Use 0 for all.",
+    )
+    args = parser.parse_args()
+
+    image_dir = PATHS.generated_attacks_images_dir / args.dataset / args.split
     predictor = PatchPredictor()
 
     image_paths = sorted(
-    p
-    for p in PATHS.generated_attacks_images_dir.iterdir()
-    if p.suffix.lower() in (".jpg", ".jpeg", ".png")
-    )[:100]
+        p for p in image_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png")
+    )
+
+    if args.max_images:
+        image_paths = image_paths[: args.max_images]
+
+    logger.info(
+        "Running inference on %d image(s) from %s (%s/%s)",
+        len(image_paths),
+        image_dir,
+        args.dataset,
+        args.split,
+    )
 
     predictions = predictor.predict_batch(image_paths)
 

@@ -20,6 +20,18 @@ fork this file.
 
 All output directories are created on import (``mkdir(parents=True,
 exist_ok=True)``) so downstream scripts can assume they exist.
+
+Multi-dataset registry
+-----------------------
+``DATASETS`` is the single source of truth for every clean-document
+dataset used by the typographic pipeline. Each entry provides:
+
+    - clean_train : Path to the training-split image directory
+    - clean_test  : Path to the test/eval-split image directory
+    - image_glob  : Glob pattern used to enumerate images in that dir
+
+``build_receipt_dataset.py`` and other multi-dataset-aware scripts
+should read from ``DATASETS`` directly rather than hardcoding paths.
 """
 
 import logging
@@ -36,6 +48,7 @@ if not logger.handlers:
 
 __all__ = [
     "PROJECT_ROOT",
+    "DATASETS",
     "DATASET_PATH",
     "TRAIN_IMAGES",
     "TEST_IMAGES",
@@ -45,6 +58,7 @@ __all__ = [
     "FEATURE_OUTPUT",
     "ATTACK_OUTPUT",
     "METADATA_OUTPUT",
+    "get_dataset_images",
 ]
 
 # ===============================
@@ -61,9 +75,52 @@ PROJECT_ROOT: Path = (
 
 DATASET_PATH: Path = PROJECT_ROOT / "datasets" / "SROIE" / "SROIE2019"
 
-TRAIN_IMAGES: Path = DATASET_PATH / "train" / "img"
+# ===============================
+# Multi-dataset registry
+# ===============================
 
-TEST_IMAGES: Path = DATASET_PATH / "test" / "img"
+DATASETS: dict = {
+    "sroie": {
+        "clean_train": PROJECT_ROOT / "datasets" / "SROIE" / "SROIE2019" / "train" / "img",
+        "clean_test": PROJECT_ROOT / "datasets" / "SROIE" / "SROIE2019" / "test" / "img",
+        "image_glob": "*.jpg",
+    },
+    "cord": {
+        "clean_train": PROJECT_ROOT / "datasets" / "CORD" / "train" / "image",
+        "clean_test": PROJECT_ROOT / "datasets" / "CORD" / "test" / "image",
+        "image_glob": "*.png",
+    },
+    "funsd": {
+        "clean_train": PROJECT_ROOT / "datasets" / "FUNSD" / "dataset" / "training_data" / "images",
+        "clean_test": PROJECT_ROOT / "datasets" / "FUNSD" / "dataset" / "testing_data" / "images",
+        "image_glob": "*.png",
+    },
+}
+
+
+def get_dataset_images(dataset: str, split: str = "train") -> Path:
+    """
+    Returns the image directory for the requested dataset/split.
+
+    split: "train" or "test".
+    """
+
+    dataset = dataset.lower()
+
+    if dataset not in DATASETS:
+        raise ValueError(f"Unknown dataset: {dataset}")
+
+    key = "clean_train" if split == "train" else "clean_test"
+
+    return DATASETS[dataset][key]
+
+
+# Backward-compatible aliases (SROIE case), kept so any existing
+# callers (ocr.py, typography.py, semantic.py, receipt_features.py,
+# feature_vector.py, predict.py) that import TRAIN_IMAGES / TEST_IMAGES
+# directly continue to work unchanged.
+TRAIN_IMAGES: Path = get_dataset_images("sroie", "train")
+TEST_IMAGES: Path = get_dataset_images("sroie", "test")
 
 OUTPUT_PATH: Path = PROJECT_ROOT / "outputs"
 
@@ -111,21 +168,27 @@ def _ensure_output_dirs() -> None:
 
 def _warn_if_dataset_missing() -> None:
     """
-    Logs a non-fatal warning if the expected SROIE training images are
-    not present. Scripts that don't need the dataset (e.g. predict.py
-    on a single external image) should still be able to import this
-    module successfully, so this intentionally does not raise.
+    Logs a non-fatal warning for any dataset whose clean_train images
+    are not present. Scripts that don't need a given dataset (e.g.
+    predict.py on a single external image) should still be able to
+    import this module successfully, so this intentionally does not
+    raise.
     """
 
-    if not TRAIN_IMAGES.exists():
+    for name, paths in DATASETS.items():
 
-        logger.warning(
-            "TRAIN_IMAGES path does not exist: %s\n"
-            "Dataset-building scripts will silently produce 0 samples "
-            "until the SROIE dataset is placed here, or MMSHIELD_ROOT "
-            "is set to point at a valid dataset location.",
-            TRAIN_IMAGES,
-        )
+        train_dir = paths["clean_train"]
+
+        if not train_dir.exists():
+
+            logger.warning(
+                "%s clean_train path does not exist: %s\n"
+                "Dataset-building scripts will silently produce 0 samples "
+                "for this dataset until it is placed here, or MMSHIELD_ROOT "
+                "is set to point at a valid dataset location.",
+                name.upper(),
+                train_dir,
+            )
 
 
 _ensure_output_dirs()
